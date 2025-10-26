@@ -52,7 +52,7 @@ class TestContainer implements ContainerInterface
 
             ServerConnectorInterface::class => function () {
                 return new ServerConnector(
-                    socketAddress: 'no-addr',
+                    socketAddress: (string) ($_ENV['SERVER_ADDRESS'] ?? null),
                     logger: $this->get(LoggerInterface::class)
                 );
             },
