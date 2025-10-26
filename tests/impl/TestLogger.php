@@ -61,7 +61,7 @@ readonly class TestLogger implements LoggerInterface
         $text = sprintf(
             "%s: %s: %s [%s]\n",
             date('Y-m-d H:i:s.u'),
-            $level,
+            strtoupper($level),
             $message,
             json_encode($context),
         );
