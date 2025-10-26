@@ -56,12 +56,16 @@ class SConcur
 
     public static function getServerConnector(): ServerConnectorInterface
     {
+        self::checkInitialization();
+
         return static::$serverConnector
             ??= static::$container->get(ServerConnectorInterface::class);
     }
 
     public static function getParametersResolver(): ParametersResolverInterface
     {
+        self::checkInitialization();
+
         return static::$parametersResolver
             ??= static::$container->get(ParametersResolverInterface::class);
     }
@@ -71,6 +75,8 @@ class SConcur
      */
     public static function detectResult(string $taskKey): TaskResultDto
     {
+        self::checkInitialization();
+
         if (static::$currentResult?->key === $taskKey) {
             $currentResult = static::$currentResult;
 
@@ -100,11 +106,7 @@ class SConcur
         ?int $limitCount = null,
         ?Context $context = null
     ): Generator {
-        if (!static::$initialized) {
-            throw new LogicException(
-                'SConcur is not initialized'
-            );
-        }
+        self::checkInitialization();
 
         if (Fiber::getCurrent()) {
             throw new AlreadyRunningException(
@@ -290,6 +292,8 @@ class SConcur
      */
     public static function wait(string $taskKey): void
     {
+        self::checkInitialization();
+
         if (!Fiber::getCurrent()) {
             return;
         }
@@ -299,6 +303,15 @@ class SConcur
         } catch (Throwable $exception) {
             throw new ContinueException(
                 previous: $exception
+            );
+        }
+    }
+
+    protected static function checkInitialization(): void
+    {
+        if (!static::$initialized) {
+            throw new LogicException(
+                'SConcur is not initialized'
             );
         }
     }
