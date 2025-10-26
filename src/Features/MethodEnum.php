@@ -4,5 +4,6 @@ namespace SConcur\Features;
 
 enum MethodEnum: int
 {
-    case Sleep = 1;
+    case Read = 1;
+    case Sleep = 2;
 }

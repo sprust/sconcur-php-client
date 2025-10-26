@@ -9,6 +9,8 @@ use SConcur\Features\MethodEnum;
 
 interface ServerConnectorInterface
 {
+    public function clone(): ServerConnectorInterface;
+
     public function connect(): void;
 
     public function disconnect(): void;

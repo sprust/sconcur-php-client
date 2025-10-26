@@ -13,10 +13,11 @@ use SConcur\Exceptions\ContextCheckerException;
 use SConcur\Exceptions\InvalidResponseLengthException;
 use SConcur\Exceptions\NotConnectedException;
 use SConcur\Exceptions\ReadException;
-use SConcur\Exceptions\UnexpectedResponseStructureException;
+use SConcur\Exceptions\UnexpectedResponseFormatException;
 use SConcur\Exceptions\WriteException;
 use SConcur\Exceptions\ResponseIsNotJsonException;
 use SConcur\Features\MethodEnum;
+use SConcur\SConcur;
 use Throwable;
 
 class ServerConnector implements ServerConnectorInterface
@@ -37,6 +38,18 @@ class ServerConnector implements ServerConnectorInterface
         protected LoggerInterface $logger,
     ) {
         $this->taskKeyPrefix = (getmypid() ?: throw new RuntimeException('Can not get pid')) . '-';
+    }
+
+    public function clone(): ServerConnectorInterface
+    {
+        $connector = new ServerConnector(
+            socketAddress: $this->socketAddress,
+            logger: $this->logger,
+        );
+
+        $connector->connect();
+
+        return $connector;
     }
 
     public function connect(): void
@@ -74,7 +87,7 @@ class ServerConnector implements ServerConnectorInterface
             return;
         }
 
-        socket_set_nonblock($socket);
+        socket_set_blocking($socket, false);
 
         $this->socket = $socket;
 
@@ -84,7 +97,7 @@ class ServerConnector implements ServerConnectorInterface
     public function disconnect(): void
     {
         if ($this->socket) {
-            socket_close($this->socket);
+            fclose($this->socket);
         }
 
         $this->socket    = null;
@@ -115,9 +128,10 @@ class ServerConnector implements ServerConnectorInterface
         );
 
         $data = json_encode([
-            'm' => $method->value,
-            'k' => $taskKey,
-            'p' => $payload,
+            'fu' => SConcur::getFlowUuid(),
+            'md' => $method->value,
+            'tk' => $taskKey,
+            'pl' => $payload,
         ]);
 
         $dataLength   = strlen($data);
@@ -131,10 +145,9 @@ class ServerConnector implements ServerConnectorInterface
             $chunk = substr($buffer, $sentBytes, $bufferSize);
 
             try {
-                $bytes = socket_write(
-                    socket: $this->socket,
+                $bytes = fwrite(
+                    stream: $this->socket,
                     data: $chunk,
-                    length: strlen($chunk)
                 );
             } catch (Throwable $exception) {
                 throw new WriteException(
@@ -162,7 +175,7 @@ class ServerConnector implements ServerConnectorInterface
      * @throws ResponseIsNotJsonException
      * @throws ReadException
      * @throws InvalidResponseLengthException
-     * @throws UnexpectedResponseStructureException
+     * @throws UnexpectedResponseFormatException
      * @throws NotConnectedException
      */
     public function read(Context $context): ?TaskResultDto
@@ -181,8 +194,8 @@ class ServerConnector implements ServerConnectorInterface
 
         while (true) {
             try {
-                $responseChunk = socket_read(
-                    socket: $socket,
+                $responseChunk = fread(
+                    stream: $socket,
                     length: $bufferSize
                 );
             } catch (Throwable $exception) {
@@ -244,42 +257,34 @@ class ServerConnector implements ServerConnectorInterface
 
         $errors = [];
 
-        $key = $data['k'] ?? null;
+        $key = $data['tk'] ?? null;
 
         if (!$key) {
-            $errors[] = 'k[key] is empty';
-        }
-
-        $method = $data['m'] ?? null;
-
-        if (!$method) {
-            $errors[] = 'm[method] is empty';
-        } else {
-            $method = MethodEnum::tryFrom($method);
-
-            if (!$method) {
-                $errors[] = 'm[method] is invalid';
-            }
+            $errors[] = 'tk[key] is empty';
         }
 
         $result = '';
 
-        if (array_key_exists('r', $data)) {
-            $errors[] = 'r[result] is empty';
+        if (array_key_exists('rs', $data)) {
+            $result = $data['rs'];
         } else {
-            $result = $data['r'];
+            $errors[] = 'rs[result] is empty';
         }
 
         if (count($errors) > 0) {
-            throw new UnexpectedResponseStructureException(
+            throw new UnexpectedResponseFormatException(
                 errors: $errors,
             );
         }
 
         return new TaskResultDto(
             key: $key,
-            method: $method,
             result: $result,
         );
+    }
+
+    public function __destruct()
+    {
+        $this->disconnect();
     }
 }

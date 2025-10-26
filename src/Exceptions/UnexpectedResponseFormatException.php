@@ -6,7 +6,7 @@ namespace SConcur\Exceptions;
 
 use Exception;
 
-class UnexpectedResponseStructureException extends Exception
+class UnexpectedResponseFormatException extends Exception
 {
     /**
      * @param array<string> $errors

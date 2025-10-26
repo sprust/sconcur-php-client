@@ -23,6 +23,7 @@ use SConcur\Exceptions\FiberNotFoundByTaskKeyException;
 use SConcur\Exceptions\InvalidValueException;
 use SConcur\Exceptions\ResumeException;
 use SConcur\Exceptions\StartException;
+use SConcur\Features\MethodEnum;
 use Throwable;
 
 class SConcur
@@ -30,6 +31,8 @@ class SConcur
     protected static bool $initialized = false;
     protected static bool $connected = false;
     protected static bool $running = false;
+
+    protected static string $flowUuid;
 
     protected static ContainerInterface $container;
 
@@ -51,12 +54,12 @@ class SConcur
 
     public static function isConcurrency(): bool
     {
-        return self::$initialized && self::$running && static::$connected;
+        return static::$initialized && static::$running && static::$connected;
     }
 
     public static function getServerConnector(): ServerConnectorInterface
     {
-        self::checkInitialization();
+        static::checkInitialization();
 
         return static::$serverConnector
             ??= static::$container->get(ServerConnectorInterface::class);
@@ -64,10 +67,15 @@ class SConcur
 
     public static function getParametersResolver(): ParametersResolverInterface
     {
-        self::checkInitialization();
+        static::checkInitialization();
 
         return static::$parametersResolver
             ??= static::$container->get(ParametersResolverInterface::class);
+    }
+
+    public static function getFlowUuid(): string
+    {
+        return self::$flowUuid;
     }
 
     /**
@@ -75,7 +83,7 @@ class SConcur
      */
     public static function detectResult(string $taskKey): TaskResultDto
     {
-        self::checkInitialization();
+        static::checkInitialization();
 
         if (static::$currentResult?->key === $taskKey) {
             $currentResult = static::$currentResult;
@@ -106,7 +114,7 @@ class SConcur
         ?int $limitCount = null,
         ?Context $context = null
     ): Generator {
-        self::checkInitialization();
+        static::checkInitialization();
 
         if (Fiber::getCurrent()) {
             throw new AlreadyRunningException(
@@ -120,14 +128,10 @@ class SConcur
             );
         }
 
-        static::$running = true;
+        static::$running  = true;
+        static::$flowUuid = uniqid(more_entropy: true);
 
         try {
-            $serverConnector    = static::getServerConnector();
-            $parametersResolver = static::getParametersResolver();
-
-            $serverConnector->connect();
-
             $limitCount ??= 0;
 
             if (is_null($context)) {
@@ -139,6 +143,11 @@ class SConcur
                     new Timer(timeoutSeconds: $timeoutSeconds)
                 );
             }
+
+            $serverConnector    = static::getServerConnector();
+            $parametersResolver = static::getParametersResolver();
+
+            $serverConnector->connect();
 
             if (!$serverConnector->isConnected()) {
                 static::$connected = false;
@@ -169,6 +178,12 @@ class SConcur
             }
 
             static::$connected = true;
+
+            $serverConnector->write(
+                context: $context,
+                method: MethodEnum::Read,
+                payload: ''
+            );
 
             /** @var array<string, array{fk: string, fi: Fiber}> $fibersByTaskKey */
             $fibersByTaskKey = [];
@@ -283,7 +298,7 @@ class SConcur
             static::$running   = false;
             static::$connected = false;
 
-            self::$serverConnector?->disconnect();
+            static::$serverConnector?->disconnect();
         }
     }
 
@@ -292,7 +307,7 @@ class SConcur
      */
     public static function wait(string $taskKey): void
     {
-        self::checkInitialization();
+        static::checkInitialization();
 
         if (!Fiber::getCurrent()) {
             return;
