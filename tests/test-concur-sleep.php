@@ -20,11 +20,36 @@ $callbacks = [
     function (Context $context) {
         SleepFeature::usleep(context: $context, microseconds: 1_000_000);
     },
+    function (Context $context) {
+        SleepFeature::sleep(context: $context, seconds: 1);
+    },
+    function (Context $context) {
+        SleepFeature::usleep(context: $context, microseconds: 1_000_000);
+    },
+    function (Context $context) {
+        SleepFeature::sleep(context: $context, seconds: 1);
+    },
+    function (Context $context) {
+        SleepFeature::usleep(context: $context, microseconds: 1_000_000);
+    },
+    function (Context $context) {
+        SleepFeature::sleep(context: $context, seconds: 1);
+    },
+    function (Context $context) {
+        SleepFeature::usleep(context: $context, microseconds: 1_000_000);
+    },
+    function (Context $context) {
+        SleepFeature::sleep(context: $context, seconds: 1);
+    },
+    function (Context $context) {
+        SleepFeature::usleep(context: $context, microseconds: 1_000_000);
+    },
 ];
 
 $generator = SConcur::run(
     callbacks: $callbacks,
-    timeoutSeconds: 3
+    timeoutSeconds: 3,
+    limitCount: 5,
 );
 
 foreach ($generator as $key => $result) {

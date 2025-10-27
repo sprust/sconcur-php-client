@@ -10,7 +10,6 @@ use SConcur\Dto\TaskResultDto;
 use SConcur\Entities\Context;
 use SConcur\Exceptions\ConnectException;
 use SConcur\Exceptions\ContextCheckerException;
-use SConcur\Exceptions\InvalidResponseLengthException;
 use SConcur\Exceptions\NotConnectedException;
 use SConcur\Exceptions\ReadException;
 use SConcur\Exceptions\UnexpectedResponseFormatException;
@@ -32,6 +31,7 @@ class ServerConnector implements ServerConnectorInterface
     protected int $socketBufferSize = 8024;
 
     protected bool $connected = false;
+    protected int $lengthPrefixLength = 4;
 
     public function __construct(
         protected string $socketAddress,
@@ -136,7 +136,7 @@ class ServerConnector implements ServerConnectorInterface
 
         $dataLength   = strlen($data);
         $buffer       = pack('N', $dataLength) . $data;
-        $bufferLength = $dataLength + 4;
+        $bufferLength = $dataLength + $this->lengthPrefixLength;
 
         $sentBytes  = 0;
         $bufferSize = $this->socketBufferSize;
@@ -174,7 +174,6 @@ class ServerConnector implements ServerConnectorInterface
      * @throws ContextCheckerException
      * @throws ResponseIsNotJsonException
      * @throws ReadException
-     * @throws InvalidResponseLengthException
      * @throws UnexpectedResponseFormatException
      * @throws NotConnectedException
      */
@@ -186,65 +185,54 @@ class ServerConnector implements ServerConnectorInterface
             );
         }
 
-        $socket     = $this->socket;
-        $bufferSize = $this->socketBufferSize;
+        $socket = $this->socket;
 
-        $dataLength = 0;
-        $response   = '';
+        $lengthHeader = '';
 
-        while (true) {
+        while (strlen($lengthHeader) < 4) {
             try {
-                $responseChunk = fread(
+                $chunk = fread(
                     stream: $socket,
-                    length: $bufferSize
+                    length: 4 - strlen($lengthHeader)
                 );
             } catch (Throwable $exception) {
                 throw new ReadException(
                     message: $exception->getMessage(),
-                    previous: $exception,
                 );
             }
 
-            if ($responseChunk === false || $responseChunk === '') {
+            if ($chunk === false || $chunk === '') {
                 $context->check();
 
-                if ($response) {
-                    continue;
-                }
+                usleep(100);
 
-                return null;
-            }
-
-            $response .= $responseChunk;
-
-            $actualResponseLength = strlen($response);
-
-            if ($dataLength) {
-                if ($actualResponseLength < $dataLength) {
-                    continue;
-                }
-
-                if ($actualResponseLength > $dataLength) {
-                    throw new InvalidResponseLengthException(
-                        expectedLength: $dataLength,
-                        actualLength: $actualResponseLength,
-                    );
-                }
-
-                break;
-            }
-
-            if ($actualResponseLength < 4) {
                 continue;
             }
 
-            $dataLength = unpack('N', substr($response, 0, 4))[1];
+            $lengthHeader .= $chunk;
+        }
 
-            $response = substr($response, 4);
+        $response   = ""; // TODO: what!?
+        $dataLength = unpack('N', $lengthHeader)[1];
+        $bufferSize = $this->socketBufferSize;
+
+        while (strlen($response) < $dataLength) {
+            $chunk = fread(
+                stream: $socket,
+                length: min($bufferSize, $dataLength - strlen($response))
+            );
+
+            if ($chunk === false || $chunk === '') {
+                $context->check();
+
+                continue;
+            }
+
+            $response .= $chunk;
         }
 
         try {
-            $data = json_decode(
+            $responseData = json_decode(
                 json: $response,
                 associative: true,
                 flags: JSON_THROW_ON_ERROR
@@ -255,32 +243,20 @@ class ServerConnector implements ServerConnectorInterface
             );
         }
 
-        $errors = [];
-
-        $key = $data['tk'] ?? null;
-
-        if (!$key) {
-            $errors[] = 'tk[key] is empty';
-        }
-
-        $result = '';
-
-        if (array_key_exists('rs', $data)) {
-            $result = $data['rs'];
-        } else {
-            $errors[] = 'rs[result] is empty';
-        }
-
-        if (count($errors) > 0) {
+        try {
+            return new TaskResultDto(
+                flowUuid: $responseData['fu'],
+                method: MethodEnum::from($responseData['md']),
+                key: $responseData['tk'],
+                isError: $responseData['er'],
+                payload: $responseData['pl'],
+            );
+        } catch (Throwable $exception) {
             throw new UnexpectedResponseFormatException(
-                errors: $errors,
+                message: $exception->getMessage(),
+                previous: $exception,
             );
         }
-
-        return new TaskResultDto(
-            key: $key,
-            result: $result,
-        );
     }
 
     public function __destruct()

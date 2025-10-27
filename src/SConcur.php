@@ -193,56 +193,54 @@ class SConcur
                 $callbacks
             );
 
-            $shiftFibers = true;
-
             while (count($fibers) > 0) {
                 $context->check();
 
-                if ($shiftFibers) {
-                    if ($limitCount > 0 && count($fibers) >= $limitCount) {
-                        $fiberKeys = array_keys(array_slice($fibers, 0, 100, true));
-                    } else {
-                        $fiberKeys = array_keys($fibers);
-                    }
+                if ($limitCount > 0 && count($fibers) >= $limitCount) {
+                    $fiberKeys = array_keys(array_slice($fibers, 0, $limitCount, true));
+                } else {
+                    $fiberKeys = array_keys($fibers);
+                }
 
-                    foreach ($fiberKeys as $fiberKey) {
-                        $context->check();
+                foreach ($fiberKeys as $fiberKey) {
+                    $context->check();
 
-                        $fiberData = $fibers[$fiberKey];
+                    $fiberData = $fibers[$fiberKey];
 
-                        if (!$fiberData->isStarted()) {
-                            $parameters = $parametersResolver->make(
-                                context: $context,
-                                callback: $callbacks[$fiberKey]
+                    if (!$fiberData->isStarted()) {
+                        $parameters = $parametersResolver->make(
+                            context: $context,
+                            callback: $callbacks[$fiberKey]
+                        );
+
+                        unset($callbacks[$fiberKey]);
+
+                        try {
+                            $taskKey = $fiberData->start(...$parameters);
+                        } catch (Throwable $exception) {
+                            throw new StartException(
+                                message: $exception->getMessage(),
+                                previous: $exception
                             );
-
-                            unset($callbacks[$fiberKey]);
-
-                            try {
-                                $taskKey = $fiberData->start(...$parameters);
-                            } catch (Throwable $exception) {
-                                throw new StartException(
-                                    message: $exception->getMessage(),
-                                    previous: $exception
-                                );
-                            }
-
-                            $fibersByTaskKey[$taskKey] = [
-                                'fk' => $fiberKey,
-                                'fi' => $fiberData,
-                            ];
                         }
+
+                        $fibersByTaskKey[$taskKey] = [
+                            'fk' => $fiberKey,
+                            'fi' => $fiberData,
+                        ];
                     }
                 }
 
-                $taskResult = $serverConnector->read(
-                    context: $context,
-                );
+                while (true) {
+                    $taskResult = $serverConnector->read(
+                        context: $context,
+                    );
 
-                if ($taskResult === null) {
-                    $shiftFibers = false;
+                    if ($taskResult === null) {
+                        continue;
+                    }
 
-                    continue;
+                    break;
                 }
 
                 $taskKey = $taskResult->key;
@@ -285,8 +283,6 @@ class SConcur
 
                     unset($fibers[$fiberKey]);
                     unset($fibersByTaskKey[$taskKey]);
-
-                    $shiftFibers = true;
 
                     yield new FeatureResultDto(
                         key: $taskKey,

@@ -39,15 +39,13 @@ readonly class SleepFeature
 
         $connector = SConcur::getServerConnector()->clone();
 
-        $runningTask = $connector
-            ->write(
-                context: $context,
-                method: MethodEnum::Sleep,
-                payload: json_encode([
-                    'f' => SConcur::getFlowUuid(),
-                    'm' => $microseconds,
-                ])
-            );
+        $runningTask = $connector->write(
+            context: $context,
+            method: MethodEnum::Sleep,
+            payload: json_encode([
+                'ms' => $microseconds,
+            ])
+        );
 
         $connector->disconnect();
 

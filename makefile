@@ -39,3 +39,6 @@ test:
   		--display-notices \
   		--display-warnings \
 		tests ${c}
+
+test-sleep:
+	"$(PHP_CLI)" php tests/test-concur-sleep.php
