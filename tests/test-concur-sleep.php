@@ -17,16 +17,20 @@ $start = microtime(true);
 
 $callbacks = [];
 
-$total   = (int) ($_SERVER['argv'][1] ?? 5);
-$seconds = (int) ($_SERVER['argv'][2] ?? 1);
-$timeout = (int) ($_SERVER['argv'][3] ?? 2);
+$total      = (int) ($_SERVER['argv'][1] ?? 5);
+$seconds    = (int) ($_SERVER['argv'][2] ?? 1);
+$timeout    = (int) ($_SERVER['argv'][3] ?? 2);
+$limitCount = (int) ($_SERVER['argv'][4] ?? 0);
 
 echo "Total call:\t$total\n";
 echo "Seconds:\t$seconds\n";
 echo "Timeout:\t$timeout\n";
+echo "Limit:\t$limitCount\n";
 echo "\n";
 
 foreach (range(1, $total) as $item) {
+    echo "item: $item\n";
+
     $callbacks[] = static function (Context $context) use ($seconds) {
         SleepFeature::sleep(context: $context, seconds: $seconds);
     };
@@ -35,7 +39,7 @@ foreach (range(1, $total) as $item) {
 $generator = SConcur::run(
     callbacks: $callbacks,
     timeoutSeconds: $timeout,
-    limitCount: 0,
+    limitCount: $limitCount,
 );
 
 foreach ($generator as $result) {
