@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace SConcur\Tests\Impl;
 
+use DateTime;
 use Psr\Log\LoggerInterface;
 use Stringable;
 
@@ -60,12 +61,14 @@ readonly class TestLogger implements LoggerInterface
     {
         $text = sprintf(
             "%s: %s: %s [%s]\n",
-            date('Y-m-d H:i:s.u'),
+            (new DateTime())->format('Y-m-d H:i:s.u'),
             strtoupper($level),
             $message,
             json_encode($context),
         );
 
         file_put_contents($this->filePath, $text, FILE_APPEND);
+
+        echo $text;
     }
 }

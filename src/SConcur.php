@@ -23,7 +23,6 @@ use SConcur\Exceptions\FiberNotFoundByTaskKeyException;
 use SConcur\Exceptions\InvalidValueException;
 use SConcur\Exceptions\ResumeException;
 use SConcur\Exceptions\StartException;
-use SConcur\Features\MethodEnum;
 use Throwable;
 
 class SConcur
@@ -147,7 +146,10 @@ class SConcur
             $serverConnector    = static::getServerConnector();
             $parametersResolver = static::getParametersResolver();
 
-            $serverConnector->connect();
+            $serverConnector->connect(
+                context: $context,
+                waitHandshake: true
+            );
 
             if (!$serverConnector->isConnected()) {
                 static::$connected = false;
@@ -178,12 +180,6 @@ class SConcur
             }
 
             static::$connected = true;
-
-            $serverConnector->write(
-                context: $context,
-                method: MethodEnum::Read,
-                payload: ''
-            );
 
             /** @var array<string, array{fk: string, fi: Fiber}> $fibersByTaskKey */
             $fibersByTaskKey = [];

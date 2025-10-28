@@ -8,10 +8,10 @@ use Exception;
 
 class NotConnectedException extends Exception
 {
-    public function __construct(public readonly string $socketAddress)
+    public function __construct()
     {
         parent::__construct(
-            message: "Not connected to [$socketAddress]",
+            message: 'Not connected',
         );
     }
 }

@@ -37,7 +37,7 @@ readonly class SleepFeature
             return;
         }
 
-        $connector = SConcur::getServerConnector()->clone();
+        $connector = SConcur::getServerConnector()->clone($context);
 
         $runningTask = $connector->write(
             context: $context,

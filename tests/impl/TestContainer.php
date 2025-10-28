@@ -52,8 +52,11 @@ class TestContainer implements ContainerInterface
 
             ServerConnectorInterface::class => function () {
                 return new ServerConnector(
-                    socketAddress: (string) ($_ENV['SERVER_ADDRESS'] ?? null),
-                    logger: $this->get(LoggerInterface::class)
+                    socketAddresses: [
+                        (string) ($_ENV['SERVER_ADDRESS'] ?? null),
+                    ],
+                    logger: $this->get(LoggerInterface::class),
+                    taskKeyPrefix: (string) (getmypid() ?: throw new RuntimeException('Can not get pid'))
                 );
             },
 

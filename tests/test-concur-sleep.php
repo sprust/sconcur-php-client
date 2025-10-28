@@ -52,8 +52,8 @@ $generator = SConcur::run(
     limitCount: 5,
 );
 
-foreach ($generator as $key => $result) {
-    echo "success: $key\n";
+foreach ($generator as $result) {
+    echo "success: $result->key\n";
 }
 
 $totalTime = microtime(true) - $start;

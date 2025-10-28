@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace SConcur\Connection;
 
 use Psr\Log\LoggerInterface;
@@ -16,13 +18,12 @@ use SConcur\Exceptions\UnexpectedResponseFormatException;
 use SConcur\Exceptions\WriteException;
 use SConcur\Exceptions\ResponseIsNotJsonException;
 use SConcur\Features\MethodEnum;
+use SConcur\Logging\LoggerFormatter;
 use SConcur\SConcur;
 use Throwable;
 
 class ServerConnector implements ServerConnectorInterface
 {
-    protected string $taskKeyPrefix;
-
     /**
      * @var resource|null
      */
@@ -31,67 +32,141 @@ class ServerConnector implements ServerConnectorInterface
     protected int $socketBufferSize = 8024;
 
     protected bool $connected = false;
+
+    protected string $socketAddress = '';
+
     protected int $lengthPrefixLength = 4;
 
+    protected static int $tasksCounter = 0;
+
+    /**
+     * @param string[] $socketAddresses
+     */
     public function __construct(
-        protected string $socketAddress,
+        protected array $socketAddresses,
         protected LoggerInterface $logger,
+        protected string $taskKeyPrefix,
     ) {
-        $this->taskKeyPrefix = (getmypid() ?: throw new RuntimeException('Can not get pid')) . '-';
+        if (count($socketAddresses) === 0) {
+            throw new RuntimeException('No socket addresses provided');
+        }
     }
 
-    public function clone(): ServerConnectorInterface
+    /**
+     * @throws UnexpectedResponseFormatException
+     * @throws ResponseIsNotJsonException
+     * @throws NotConnectedException
+     * @throws ContextCheckerException
+     * @throws ReadException
+     * @throws WriteException
+     */
+    public function clone(Context $context): ServerConnectorInterface
     {
         $connector = new ServerConnector(
-            socketAddress: $this->socketAddress,
+            socketAddresses: [
+                $this->socketAddress,
+            ],
             logger: $this->logger,
+            taskKeyPrefix: $this->taskKeyPrefix,
         );
 
-        $connector->connect();
+        $connector->connect(
+            context: $context,
+            waitHandshake: false
+        );;
 
         return $connector;
     }
 
-    public function connect(): void
+    /**
+     * @throws UnexpectedResponseFormatException
+     * @throws ResponseIsNotJsonException
+     * @throws NotConnectedException
+     * @throws ReadException
+     * @throws ContextCheckerException
+     * @throws WriteException
+     */
+    public function connect(Context $context, bool $waitHandshake): void
     {
-        try {
-            $socket = @stream_socket_client(
-                address: $this->socketAddress,
-                error_code: $errno,
-                error_message: $errorString,
-                timeout: 2.0,
-            );
-        } catch (Throwable $exception) {
-            $this->logger->error(
-                (string) new ConnectException(
-                    socketAddress: $this->socketAddress,
-                    error: $exception->getMessage()
+        foreach ($this->socketAddresses as $socketAddress) {
+            $this->disconnect();
+
+            $errorString = '';
+
+            try {
+                $socket = @stream_socket_client(
+                    address: $socketAddress,
+                    error_code: $errno,
+                    error_message: $errorString,
+                    timeout: 2.0,
+                );
+            } catch (Throwable $exception) {
+                $this->logger->error(
+                    LoggerFormatter::make(
+                        message: (string) new ConnectException(
+                            socketAddress: $socketAddress,
+                            error: ($errorString ? "socket error: $errorString, message: " : '')
+                            . $exception->getMessage()
+                        )
+                    )
+                );
+
+                continue;
+            }
+
+            if (!$socket) {
+                $this->logger->error(
+                    LoggerFormatter::make(
+                        message: (string) new ConnectException(
+                            socketAddress: $socketAddress,
+                            error: ($errorString ? "socket error: $errorString" : 'unknown error')
+                        )
+                    )
+                );
+
+                continue;
+            }
+
+            socket_set_blocking($socket, false);
+
+            $this->socket        = $socket;
+            $this->connected     = true;
+            $this->socketAddress = $socketAddress;
+
+            if ($waitHandshake) {
+                $this->write(
+                    context: $context,
+                    method: MethodEnum::Read,
+                    payload: ''
+                );
+
+                $handshakeTaskResult = null;
+
+                while (true) {
+                    $handshakeTaskResult = $this->read($context);
+
+                    if ($handshakeTaskResult === null) {
+                        $context->check();
+
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if ($handshakeTaskResult->isError) {
+                    continue;
+                }
+            }
+
+            $this->logger->debug(
+                LoggerFormatter::make(
+                    message: "connected to [$socketAddress]"
                 )
             );
 
-            $this->connected = false;
-
             return;
         }
-
-        if (!$socket) {
-            $this->logger->error(
-                (string) new ConnectException(
-                    socketAddress: $this->socketAddress,
-                    error: $errorString
-                )
-            );
-
-            $this->connected = false;
-
-            return;
-        }
-
-        socket_set_blocking($socket, false);
-
-        $this->socket = $socket;
-
-        $this->connected = true;
     }
 
     public function disconnect(): void
@@ -100,8 +175,9 @@ class ServerConnector implements ServerConnectorInterface
             fclose($this->socket);
         }
 
-        $this->socket    = null;
-        $this->connected = false;
+        $this->socket        = null;
+        $this->connected     = false;
+        $this->socketAddress = '';
     }
 
     public function isConnected(): bool
@@ -117,13 +193,11 @@ class ServerConnector implements ServerConnectorInterface
     public function write(Context $context, MethodEnum $method, string $payload): RunningTaskDto
     {
         if (!$this->connected) {
-            throw new NotConnectedException(
-                socketAddress: $this->socketAddress
-            );
+            throw new NotConnectedException();
         }
 
         $taskKey = uniqid(
-            prefix: $this->taskKeyPrefix,
+            prefix: $this->taskKeyPrefix . ':' . ++self::$tasksCounter . ':',
             more_entropy: true
         );
 
@@ -180,9 +254,7 @@ class ServerConnector implements ServerConnectorInterface
     public function read(Context $context): ?TaskResultDto
     {
         if (!$this->connected) {
-            throw new NotConnectedException(
-                socketAddress: $this->socketAddress
-            );
+            throw new NotConnectedException();
         }
 
         $socket = $this->socket;
@@ -203,8 +275,6 @@ class ServerConnector implements ServerConnectorInterface
 
             if ($chunk === false || $chunk === '') {
                 $context->check();
-
-                usleep(100);
 
                 continue;
             }
