@@ -155,6 +155,8 @@ class ServerConnector implements ServerConnectorInterface
                 }
 
                 if ($handshakeTaskResult->isError) {
+                    $this->disconnect();
+
                     continue;
                 }
             }
