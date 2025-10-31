@@ -9,11 +9,17 @@ build:
 up:
 	docker-compose up -d
 
+stop:
+	docker-compose stop
+
 down:
 	docker-compose down
 
 bash-php:
 	"$(PHP_CLI)" bash
+
+bash-php-remote:
+	docker-compose run -it --rm php bash
 
 composer:
 	"$(PHP_CLI)" composer ${c}
@@ -41,4 +47,4 @@ test:
 		tests ${c}
 
 test-sleep:
-	"$(PHP_CLI)" php tests/test-concur-sleep.php
+	"$(PHP_CLI)" php tests/test-concur-sleep.php ${c}
