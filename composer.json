@@ -12,7 +12,9 @@
         "ext-sockets": "*",
         "php": "^8.2",
         "psr/container": "^2.0",
-        "psr/log": "^3.0"
+        "psr/log": "^3.0",
+        "mongodb/mongodb": "^1.21",
+        "ext-mongodb": "*"
     },
     "require-dev": {
         "phpunit/phpunit": "^11.5",
