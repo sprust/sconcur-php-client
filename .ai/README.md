@@ -39,7 +39,8 @@ User-facing documentation (each doc also exists in Russian as `*.ru.md`):
   [socket-server](../docs/socket-server.md),
   [socket-client](../docs/socket-client.md),
   [websocket-server](../docs/websocket-server.md),
-  [websocket-client](../docs/websocket-client.md), [amqp](../docs/amqp.md)
+  [websocket-client](../docs/websocket-client.md), [amqp](../docs/amqp.md),
+  [redis](../docs/redis.md)
 - Operations: [worker-master](../docs/worker-master.md),
   [admin-stats](../docs/admin-stats.md)
 - Guides: [adding-a-feature](../docs/adding-a-feature.md),
@@ -220,6 +221,16 @@ feature's doc. Key PHP classes not covered there:
   channel handed back with an answer the broker still owes it — a confirm or a return
   nobody waited for — is given up rather than lent on, which is the same
   misattribution delayed.
+- `Features/Redis/` — the Redis feature. `Connection` is the entry point and the
+  pool key; the typed methods live in `Support/*CommandsTrait` and all go through
+  `command()`, which is equally the way to call a command that has no method.
+  `Pipeline` collects commands for one round trip (`transaction()` is the same
+  batch inside MULTI/EXEC), `Subscription` and `Results/ScanResult` are the two
+  streams. What a connection is used for decides how it may be shared, and that
+  is the whole shape of the feature: an ordinary command joins a multiplexed
+  connection other coroutines are using, a blocking one takes a connection of its
+  own for the call, and a subscription owns one outright — see
+  [docs/redis.md](../docs/redis.md).
 - `Features/Socket/Dto/AbstractConnection` — shared base for the socket and
   WebSocket `Connection` DTOs (server accept-side and client dial-side); keeps the
   features decoupled, since all depend on the neutral base rather than each other.
@@ -261,7 +272,9 @@ The core (`ext/src/`), module by module:
   httpserver, httpclient, socketserver, socketclient, wsserver, wsclient, amqp
   (pooled connections, a channel registry, streamed consumers over `lapin`, and
   `consume_serve.rs` — the self-pumping delivery stream of a supervised worker,
-  whose channels the extension owns)
+  whose channels the extension owns), redis (a pool of multiplexed connections
+  per dsn, dedicated ones for the blocking commands and the subscriptions, and
+  the two streaming states — `scan_state.rs` and `subscribe_state.rs`)
 - `stats/` — neutral worker-side telemetry shared by the servers: process metrics
   plus `Pusher`, which samples a `Snapshot` and pushes it best-effort as a
   length-prefixed JSON frame over the collector's unix socket. One loop and one
@@ -454,8 +467,12 @@ languages. They were deliberately reworked to not read as AI-generated. Rules:
   re-narrate in prose what a parameter table says.
 - **Minimal bold.** Use `**bold**` only for a genuinely critical warning or a
   couple of key terms — heavy bolding is the top "AI-generated" tell.
-- **No duplication across docs.** The general limits (CLI only, Linux only, NTS
-  only, no `pcntl_fork`) live in the README, and feature docs link to it;
+- **No duplication across docs.** The general limits (Linux only, NTS only, what
+  a long-lived process buys over FPM, what `fork` does) live in the README, and
+  feature docs link to it rather than restating them — a restatement is what goes
+  stale, and this line did: it used to say "CLI only, no `pcntl_fork`", both of
+  which the README has contradicted since FPM and post-work `fork` were made to
+  work;
   `SO_REUSEPORT` is canonical in `docs/http-server.md`, and the other servers
   reference it and describe only their delta.
 - **Do not put source line numbers in docs** — they go stale. Reference file paths

@@ -1,0 +1,125 @@
+<?php
+
+declare(strict_types=1);
+
+namespace SConcur\Tests\Feature\Features\Redis;
+
+use SConcur\Features\Redis\Connection;
+use SConcur\Tests\Feature\BaseTestCase;
+use SConcur\Tests\Impl\TestRedisResolver;
+
+class RedisScanTest extends BaseTestCase
+{
+    private Connection $connection;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        TestRedisResolver::flush();
+
+        $this->connection = TestRedisResolver::getConnection();
+    }
+
+    public function testScanWalksTheWholeKeyspace(): void
+    {
+        $expected = [];
+
+        $pipeline = $this->connection->pipeline();
+
+        for ($index = 0; $index < 300; ++$index) {
+            $key            = "scan:key:$index";
+            $expected[$key] = true;
+
+            $pipeline->command('SET', [$key, '1']);
+        }
+
+        $pipeline->execute();
+
+        $seen = [];
+
+        foreach ($this->connection->scan(match: 'scan:key:*', count: 25, batchSize: 10) as $key) {
+            // SCAN may hand the same key over twice; the guarantee is that every key that
+            // was there the whole time comes at least once.
+            $seen[$key] = true;
+        }
+
+        self::assertSame(count($expected), count($seen));
+        self::assertSame([], array_diff_key($expected, $seen));
+    }
+
+    public function testScanIsFilteredByMatch(): void
+    {
+        $this->connection->mSet([
+            'user:1'  => 'a',
+            'user:2'  => 'b',
+            'order:1' => 'c',
+        ]);
+
+        $seen = [];
+
+        foreach ($this->connection->scan(match: 'user:*') as $key) {
+            $seen[$key] = true;
+        }
+
+        $keys = array_keys($seen);
+
+        // SCAN promises no order, so the assertion cannot depend on one.
+        sort($keys);
+
+        self::assertSame(['user:1', 'user:2'], $keys);
+    }
+
+    public function testHashScanYieldsFieldsAndValues(): void
+    {
+        $fields = [];
+
+        for ($index = 0; $index < 100; ++$index) {
+            $fields["field:$index"] = "value:$index";
+        }
+
+        $this->connection->hSet('hash', $fields);
+
+        $seen = [];
+
+        foreach ($this->connection->hScan('hash', batchSize: 7) as $field => $value) {
+            $seen[$field] = $value;
+        }
+
+        self::assertSame($fields, $seen);
+    }
+
+    public function testSortedSetScanYieldsMembersAndScores(): void
+    {
+        $this->connection->zAdd('zset', ['a' => 1.0, 'b' => 2.5]);
+
+        $seen = [];
+
+        foreach ($this->connection->zScan('zset') as $member => $score) {
+            $seen[$member] = (float) $score;
+        }
+
+        self::assertSame(['a' => 1.0, 'b' => 2.5], $seen);
+    }
+
+    public function testAnAbandonedScanLeavesNothingBehind(): void
+    {
+        $pipeline = $this->connection->pipeline();
+
+        for ($index = 0; $index < 500; ++$index) {
+            $pipeline->command('SET', ["abandon:$index", '1']);
+        }
+
+        $pipeline->execute();
+
+        foreach ($this->connection->scan(match: 'abandon:*', count: 10, batchSize: 5) as $key) {
+            self::assertNotSame('', $key);
+
+            // Walk away with the cursor open. The flow ending has to close it; the
+            // dangling-task check in tearDown is what proves it did.
+            break;
+        }
+
+        self::assertTrue($this->connection->ping());
+    }
+}
