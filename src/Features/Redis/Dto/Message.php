@@ -19,12 +19,17 @@ readonly class Message
         public string $channel,
         public string $payload,
         public string $pattern = '',
+        /**
+         * Whether this message arrived through a pattern subscription. Told by the
+         * core rather than inferred from the pattern being empty, which would be
+         * wrong for a subscription to the empty pattern.
+         */
+        protected bool $fromPattern = false,
     ) {
     }
 
-    /** Whether this message arrived through a pattern subscription. */
     public function fromPattern(): bool
     {
-        return $this->pattern !== '';
+        return $this->fromPattern;
     }
 }

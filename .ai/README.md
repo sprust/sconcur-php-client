@@ -320,7 +320,7 @@ Key enums (string-backed; the 2-3 letter values cross the boundary):
 - `tests/impl/` — test helpers (MongoDB resolver, app bootstrap, server harnesses)
 - `tests/benchmarks/` — performance benchmarks comparing async vs native, grouped
   by the technology they measure: `mongodb/`, `mysql/`, `pgsql/`, `http/`,
-  `socket/`, `ws/`, `amqp/` (each holds its per-operation benches plus, for the protocols,
+  `socket/`, `ws/`, `amqp/`, `redis/` (each holds its per-operation benches plus, for the protocols,
   the server benches and the load scripts), `db/` (a whole DB session: repeated
   runs and their aggregation into the markdown rows of `docs/benchmarks.md`),
   `runtime/` (scheduler and the boundary, no backend involved) and `lib/`
@@ -329,8 +329,13 @@ Key enums (string-backed; the 2-3 letter values cross the boundary):
   gets a `bench-<tech>-<operation>` make target.
 - `tests/consumers/` — demo/test worker scripts that are not servers (the AMQP
   consumer), the counterpart of `tests/servers/`
-- `tests/mem-leak/` — memory leak stress tests. The AMQP soak has a target of its
-  own, `make mem-leak-amqp scenario=<name> seconds=<n>`, which sets the profiler
+- `tests/mem-leak/` — memory leak stress tests. Two features have a soak of their
+  own. `make mem-leak-redis scenario=<name> seconds=<n>` runs one of five
+  scenarios (command, pipeline, blocking, cursor, subscribe) and reports the PHP
+  heap beside the server's own client count — the three things that feature opens
+  connections for (a blocking command, a cursor, a subscription) would show up
+  there and nowhere else. The AMQP soak has
+  `make mem-leak-amqp scenario=<name> seconds=<n>`, which sets the profiler
   and reports the broker's own connections,
   channels and consumers beside them — a worker flat on its own memory can still leave
   sockets behind on the other side. Two scenarios cover `QueueConsumer` and

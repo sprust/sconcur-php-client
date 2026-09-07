@@ -69,4 +69,37 @@ class TestRedisResolver
 
         return substr_count($clients, "\n");
     }
+
+    /**
+     * How many connections the server has accepted since it started.
+     *
+     * Different from the count above in the one way that matters for reuse: a
+     * client that opens and closes a connection per command leaves the open count
+     * flat while this one climbs.
+     */
+    public static function countAcceptedConnections(): int
+    {
+        $info = (string) static::getConnection()->command('INFO', ['stats']);
+
+        if (preg_match('/^total_connections_received:(\d+)/m', $info, $matches) !== 1) {
+            return 0;
+        }
+
+        return (int) $matches[1];
+    }
+
+    /**
+     * A connection to a port nothing listens on, for the tests about what happens
+     * when a dial does not finish.
+     */
+    public static function getUnreachableConnection(?int $timeoutMs = null): Connection
+    {
+        // A blackholed address rather than a closed port: a closed port is refused
+        // at once, and what these tests need is a dial that hangs until something
+        // stops it.
+        return new Connection(
+            dsn: 'redis://10.255.255.1:6379/0',
+            timeoutMs: $timeoutMs,
+        );
+    }
 }

@@ -102,10 +102,28 @@ mod tests {
 
     #[test]
     fn removing_twice_is_not_an_error() {
+        // Both an explicit close and the flow ending call remove(), in whichever
+        // order. The second one has to find nothing rather than fail.
         let registry = Subscriptions::new();
 
         assert!(registry.load("missing").is_none());
         assert!(registry.remove("missing").is_none());
         assert!(registry.remove("missing").is_none());
     }
+
+    #[test]
+    fn closing_everything_leaves_an_empty_registry() {
+        let registry = Subscriptions::new();
+
+        registry.close_all();
+
+        assert!(registry.load("sid").is_none());
+        assert!(registry.remove("sid").is_none());
+    }
+
+    // Storing is not exercised here: a Subscription needs a PubSubSink, which
+    // cannot be built without a connection. What a stored entry does with an
+    // add/remove/close is covered where it can be — against a live server, in
+    // tests/feature/Features/Redis/RedisSubscribeTest.php.
+
 }

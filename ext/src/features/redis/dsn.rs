@@ -41,12 +41,25 @@ pub fn parse(dsn: &str) -> Result<Dsn, String> {
 
     let allowed = if is_unix { UNIX_PARAMS } else { TCP_PARAMS };
 
-    for name in query_names(trimmed) {
+    for (name, value) in query_pairs(trimmed) {
         if !allowed.contains(&name.as_str()) {
             return Err(format!(
                 "unknown dsn parameter {name}: this dsn accepts {}",
                 allowed.join(", ")
             ));
+        }
+
+        // RESP3 changes the shape of what several commands answer — HGETALL
+        // becomes a map, a scored range becomes pairs — and the typed methods on
+        // the PHP side are written against RESP2. Accepting it would mean handing
+        // those methods a shape they read wrongly, quietly. Refused until the
+        // reply shape travels with the reply.
+        if name == "protocol" && (value == "3" || value.eq_ignore_ascii_case("resp3")) {
+            return Err(
+                "protocol=3 (RESP3) is not supported yet: it changes the reply shape of \
+                 several commands, and this feature reads them as RESP2"
+                    .to_string(),
+            );
         }
     }
 
@@ -55,10 +68,14 @@ pub fn parse(dsn: &str) -> Result<Dsn, String> {
     })
 }
 
-/// The parameter names of the query string, in order. Split by hand rather than
-/// with a URL parser: only the names are needed, and percent-encoding cannot
-/// appear in one that would pass the allow-list anyway.
-fn query_names(dsn: &str) -> Vec<String> {
+/// The parameters of the query string, in order.
+///
+/// The value is percent-decoded, because the driver decodes it: redis-rs reads
+/// the query with `url::Url::query_pairs`, which is form-urlencoded. Reading it
+/// raw here meant the two sides disagreed about what the dsn said — `protocol=3`
+/// was refused while `protocol=%33` sailed past and opened a RESP3 connection
+/// this feature cannot read correctly.
+fn query_pairs(dsn: &str) -> Vec<(String, String)> {
     let Some((_, query)) = dsn.split_once('?') else {
         return Vec::new();
     };
@@ -70,8 +87,52 @@ fn query_names(dsn: &str) -> Vec<String> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
-        .map(|pair| pair.split_once('=').map(|(name, _)| name).unwrap_or(pair).to_lowercase())
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) => (name.to_lowercase(), percent_decode(value)),
+            None => (pair.to_lowercase(), String::new()),
+        })
         .collect()
+}
+
+/// Percent-decoding, and the `+` a form-urlencoded query means a space by.
+///
+/// A byte that is not valid UTF-8 once decoded is left as it was written: this
+/// reads one value, and a value that decodes into nonsense is refused by the
+/// comparison that follows rather than by this function.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let high = (bytes[index + 1] as char).to_digit(16);
+                let low = (bytes[index + 2] as char).to_digit(16);
+
+                match (high, low) {
+                    (Some(high), Some(low)) => {
+                        decoded.push((high * 16 + low) as u8);
+                        index += 3;
+                    }
+                    _ => {
+                        decoded.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
 }
 
 #[cfg(test)]
@@ -103,8 +164,25 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_protocol_parameter() {
-        assert!(parse("redis://127.0.0.1:6379/0?protocol=resp3").is_ok());
+    fn accepts_the_protocol_parameter_at_resp2() {
+        assert!(parse("redis://127.0.0.1:6379/0?protocol=2").is_ok());
+    }
+
+    #[test]
+    fn refuses_resp3() {
+        for dsn in [
+            "redis://127.0.0.1:6379/0?protocol=3",
+            "redis://127.0.0.1:6379/0?protocol=resp3",
+            "redis://127.0.0.1:6379/0?protocol=RESP3",
+            // Percent-encoded, which the driver decodes and this used to not.
+            "redis://127.0.0.1:6379/0?protocol=%33",
+            "redis://127.0.0.1:6379/0?protocol=%72esp3",
+            "redis://127.0.0.1:6379/0?protocol=res%70%33",
+        ] {
+            let error = parse(dsn).unwrap_err();
+
+            assert!(error.contains("RESP3"), "{dsn}: {error}");
+        }
     }
 
     #[test]
@@ -123,18 +201,28 @@ mod tests {
 
     #[test]
     fn accepts_the_unix_parameters_on_a_socket_url() {
-        assert!(parse("unix:///var/run/redis.sock?db=1&user=u&pass=p&protocol=3").is_ok());
+        assert!(parse("unix:///var/run/redis.sock?db=1&user=u&pass=p&protocol=2").is_ok());
+    }
+
+    #[test]
+    fn a_value_is_read_the_way_the_driver_reads_it() {
+        assert_eq!(percent_decode("%33"), "3");
+        assert_eq!(percent_decode("resp3"), "resp3");
+        assert_eq!(percent_decode("a+b"), "a b");
+        // A stray percent is not an escape and is left alone.
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
     }
 
     #[test]
     fn keeps_the_dsn_verbatim() {
-        let dsn = parse("redis://127.0.0.1:6379/7?protocol=resp3").unwrap();
+        let dsn = parse("redis://127.0.0.1:6379/7?protocol=2").unwrap();
 
-        assert_eq!(dsn.url, "redis://127.0.0.1:6379/7?protocol=resp3");
+        assert_eq!(dsn.url, "redis://127.0.0.1:6379/7?protocol=2");
     }
 
     #[test]
     fn leaves_the_insecure_fragment_to_the_driver() {
-        assert!(parse("rediss://127.0.0.1:6379/0?protocol=3#insecure").is_ok());
+        assert!(parse("rediss://127.0.0.1:6379/0?protocol=2#insecure").is_ok());
     }
 }

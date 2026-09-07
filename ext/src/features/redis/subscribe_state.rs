@@ -15,15 +15,15 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::dto::{Message, Result};
-use crate::errs::Factory;
 use crate::helpers::calc_execution_ms;
 use crate::states::{StateCloseFuture, StateContract, StateFuture};
+
+use super::errors::{message as fail, Kind};
 
 pub struct SubscribeState {
     stream: Mutex<Option<PubSubStream>>,
     batch_size: usize,
     message: Arc<Message>,
-    errors: &'static Factory,
     /// Ends a next() that is waiting on a message. Cancelled when the
     /// subscription closes, so a pull that nobody will answer does not hold the
     /// state's mutex forever.
@@ -36,14 +36,12 @@ impl SubscribeState {
         stream: PubSubStream,
         batch_size: usize,
         message: Arc<Message>,
-        errors: &'static Factory,
         cancel: CancellationToken,
     ) -> Self {
         SubscribeState {
             stream: Mutex::new(Some(stream)),
             batch_size,
             message,
-            errors,
             cancel,
             start_time: Instant::now(),
         }
@@ -56,7 +54,7 @@ impl StateContract for SubscribeState {
             let mut guard = self.stream.lock().await;
 
             let Some(stream) = guard.as_mut() else {
-                return Result::error(&self.message, self.errors.by_text("subscription is closed"));
+                return Result::error(&self.message, fail(Kind::State, "subscription is closed"));
             };
 
             let mut messages: Vec<Vec<u8>> = Vec::new();

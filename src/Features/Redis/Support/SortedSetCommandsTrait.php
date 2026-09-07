@@ -114,27 +114,20 @@ trait SortedSetCommandsTrait
         /** @var array<int|string, mixed> $reply */
         $reply = $this->command($name, $arguments);
 
+        $values = array_values($reply);
+
         if (!$withScores) {
-            return array_map(static fn(mixed $item): string => (string) $item, array_values($reply));
+            return array_map(static fn(mixed $item): string => (string) $item, $values);
         }
 
-        // RESP3 answers a scored range with pairs already; RESP2 with member and score
-        // alternating.
-        if (!array_is_list($reply)) {
-            $scores = [];
-
-            foreach ($reply as $member => $score) {
-                $scores[(string) $member] = (float) $score;
-            }
-
-            return $scores;
-        }
-
+        // Member and score alternating, which is what WITHSCORES answers. RESP3
+        // would send pairs instead, and the dsn refuses RESP3 rather than leave
+        // this method guessing which shape it was handed.
         $scores = [];
-        $count  = count($reply);
+        $count  = count($values);
 
         for ($index = 0; $index + 1 < $count; $index += 2) {
-            $scores[(string) $reply[$index]] = (float) $reply[$index + 1];
+            $scores[(string) $values[$index]] = (float) $values[$index + 1];
         }
 
         return $scores;

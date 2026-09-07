@@ -41,6 +41,18 @@ class Subscription implements Iterator
 
     protected bool $finished = false;
 
+    protected bool $released = false;
+
+    protected bool $started = false;
+
+    /**
+     * Whether the message currently held has already been handed to a read().
+     * A loop started after one must go on to the next message rather than serve
+     * that one again — a subscriber doing the work twice is the whole cost of a
+     * duplicate.
+     */
+    protected bool $currentConsumed = false;
+
     public function __construct(
         protected readonly Connection $connection,
         public readonly string $subscriptionId,
@@ -99,6 +111,12 @@ class Subscription implements Iterator
             command: RedisCommandEnum::SubscriptionClose,
             data: ['sid' => $this->subscriptionId],
         );
+
+        // The core released the subscription; the flow that owned the stream is
+        // this side's to release. Nothing else will: the destructor skips a closed
+        // subscription, and the core's own cleanup hook waits on a flow that
+        // closing this way never ends. A no-op in async mode.
+        $this->releaseTask();
     }
 
     public function current(): mixed
@@ -113,13 +131,26 @@ class Subscription implements Iterator
 
     public function valid(): bool
     {
-        return $this->current !== null;
+        return $this->started && $this->current !== null;
     }
 
     public function rewind(): void
     {
         // The stream is already open — the subscribe() that created this object opened it,
-        // and a second one would subscribe again. Rewinding pulls the first batch.
+        // and a second one would subscribe again. Rewinding pulls the first message, unless
+        // a read() has already taken one: handing that message to the loop as well would
+        // deliver it twice, and a subscriber doing the work twice is the whole cost of a
+        // duplicate.
+        $this->started = true;
+
+        if ($this->currentConsumed) {
+            $this->currentConsumed = false;
+
+            $this->pull();
+
+            return;
+        }
+
         if ($this->current === null && !$this->finished) {
             $this->pull();
         }
@@ -128,6 +159,8 @@ class Subscription implements Iterator
     public function next(): void
     {
         ++$this->index;
+
+        $this->currentConsumed = false;
 
         $this->pull();
     }
@@ -138,7 +171,13 @@ class Subscription implements Iterator
      */
     public function read(): ?Message
     {
+        $this->started = true;
+
         $this->pull();
+
+        // Marked consumed, so a loop started after this one goes on to the next
+        // message instead of serving this one again.
+        $this->currentConsumed = true;
 
         return $this->current;
     }
@@ -176,6 +215,9 @@ class Subscription implements Iterator
                 channel: (string) ($message['c'] ?? ''),
                 payload: (string) ($message['d'] ?? ''),
                 pattern: (string) ($message['p'] ?? ''),
+                // The core says which it is; an empty pattern does not, because
+                // psubscribe to an empty pattern is legal however pointless.
+                fromPattern: ($message['k'] ?? 'msg') === 'pmsg',
             );
         }
 
@@ -216,13 +258,23 @@ class Subscription implements Iterator
     }
 
     /**
-     * Releases the synchronous flow owning the stream when the subscription is abandoned
-     * without being closed. No-op in async mode and after close().
+     * Releases the synchronous flow owning the stream. No-op in async mode, and
+     * done once: close() releases it too, and whichever comes first wins.
      */
+    protected function releaseTask(): void
+    {
+        if ($this->released) {
+            return;
+        }
+
+        $this->released = true;
+
+        State::releaseSyncTaskFlow($this->streamKey);
+    }
+
+    /** Catches the subscription that was abandoned without being closed. */
     public function __destruct()
     {
-        if (!$this->closed) {
-            State::releaseSyncTaskFlow($this->streamKey);
-        }
+        $this->releaseTask();
     }
 }

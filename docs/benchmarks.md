@@ -56,11 +56,16 @@ worker log stays empty: it reports a failed feature in the response body, not to
 stderr. The run still prints a plausible requests/sec. Always check
 `Non-2xx or 3xx responses` in the wrk output before trusting a long run.
 
-Every number on this page was taken on 2026-09-04/05, on an idle machine and on
-the Rust core. The three stacks of the HTTP-server tables ran in one session with
-the placement equalised (see [Methodology](#methodology)); the DB, payload,
-client, server-feature and AMQP numbers were taken on the same disk-backed
-volumes.
+Every number on this page except the Redis ones was taken on 2026-09-04/05, on
+an idle machine and on the Rust core. The three stacks of the HTTP-server tables
+ran in one session with the placement equalised (see
+[Methodology](#methodology)); the DB, payload, client, server-feature and AMQP
+numbers were taken on the same disk-backed volumes.
+
+The Redis tables were taken on 2026-09-07, on the same machine, against the
+server in `docker-compose.yml` on its default `tmpfs` mount — the feature stores
+nothing that survives a run, so the disk-backed session those other numbers
+needed does not apply to it.
 
 ## Conversion overhead (the PHP↔extension boundary)
 
@@ -598,5 +603,13 @@ heavier — the comparison is conservative.
   the same core, which is the boundary tax.
 - A pool of three workers has an unexplained latency tail on every route that is
   not disk-bound; until that is understood, size the pool away from it.
-- Memory is practically flat across the modes — the fibers of 100 concurrent
-  operations do not move the peak noticeably.
+- Memory is practically flat across the modes for ordinary payloads — the fibers
+  of 100 concurrent operations do not move the peak noticeably. It stops being
+  flat when the payloads themselves are large: 50 concurrent 1 MB MongoDB reads
+  and 500 concurrent 1 MB Redis values both hold every result in the extension
+  and in PHP at once (see [Payload size](#payload-size) and [Redis](#redis)).
+- Redis is the one feature where the native extension wins every shape measured.
+  A command against a local server answers in about 11 µs, which is less than one
+  crossing of the boundary costs, so there is nothing to overlap; batching brings
+  the concurrent path back to within a tenth of phpredis. The gain the tables
+  cannot show is the worker that is not blocked while it waits.

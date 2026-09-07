@@ -49,11 +49,7 @@ readonly class Arguments
                 );
             }
 
-            // var_export, not a string cast: the cast rounds to the `precision` ini
-            // setting (14 digits by default), which quietly changes a sorted-set score
-            // on its way to the server. This writes the shortest form that reads back
-            // as the same double.
-            return var_export($argument, true);
+            return static::formatFloat($argument);
         }
 
         $type = get_debug_type($argument);
@@ -62,5 +58,29 @@ readonly class Arguments
             message: "Argument #$position is a $type; a Redis argument must be a string, an int or a float. "
                 . 'Serialize the value yourself — this feature stores bytes and converts nothing.',
         );
+    }
+
+    /**
+     * The shortest decimal form that reads back as the same double.
+     *
+     * Neither a string cast nor var_export can be used: the first rounds to the
+     * `precision` ini setting and the second to `serialize_precision`, so the
+     * value a sorted-set score arrives with would depend on the php.ini of the
+     * machine it was written on. Widening every float to 17 digits would be
+     * exact but would send `0.10000000000000001` for `0.1`, so the shortest
+     * exact form is found instead — at most seventeen cheap formats, and the
+     * common values land in one or two.
+     */
+    protected static function formatFloat(float $value): string
+    {
+        for ($digits = 1; $digits < 17; ++$digits) {
+            $formatted = sprintf('%.' . $digits . 'G', $value);
+
+            if ((float) $formatted === $value) {
+                return $formatted;
+            }
+        }
+
+        return sprintf('%.17G', $value);
     }
 }

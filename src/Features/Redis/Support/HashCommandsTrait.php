@@ -46,7 +46,8 @@ trait HashCommandsTrait
     }
 
     /**
-     * HMGET keyed by field, like mGet: a missing field is null.
+     * HMGET keyed by field, like mGet: a missing field is null, and a field asked
+     * for twice appears once.
      *
      * @param list<string> $fields
      *
@@ -74,9 +75,8 @@ trait HashCommandsTrait
     /**
      * The whole hash as field => value.
      *
-     * The shape is built here: on RESP2 the server answers with field and value
-     * alternating in one flat list, and on RESP3 with a map. Both end up the same way
-     * round, which is the point of the method existing.
+     * The shape is built here: the server answers with field and value alternating
+     * in one flat list, and folding it is the point of the method existing.
      *
      * @return array<string, string>
      */
@@ -133,8 +133,13 @@ trait HashCommandsTrait
     }
 
     /**
-     * A flat field/value list, or an already-keyed map, into a map. On RESP3 the server
-     * sends the map itself and there is nothing to fold.
+     * A flat field/value list into a map.
+     *
+     * The list is what the server sends, always: RESP3 would answer with a map
+     * instead, and the dsn refuses RESP3 for exactly this reason — the shape has
+     * to be known here, and guessing it from the decoded array was wrong in both
+     * directions (a hash whose fields are "0" and "1" decodes into something a
+     * list check calls a list).
      *
      * @param array<int|string, mixed> $reply
      *
@@ -142,21 +147,12 @@ trait HashCommandsTrait
      */
     protected static function pairsToMap(array $reply): array
     {
-        if (!array_is_list($reply)) {
-            $map = [];
-
-            foreach ($reply as $field => $value) {
-                $map[(string) $field] = (string) $value;
-            }
-
-            return $map;
-        }
-
-        $map   = [];
-        $count = count($reply);
+        $map    = [];
+        $values = array_values($reply);
+        $count  = count($values);
 
         for ($index = 0; $index + 1 < $count; $index += 2) {
-            $map[(string) $reply[$index]] = (string) $reply[$index + 1];
+            $map[(string) $values[$index]] = (string) $values[$index + 1];
         }
 
         return $map;

@@ -79,8 +79,8 @@ trait ListCommandsTrait
      * BLPOP: waits until one of the keys has an element, or the timeout runs out.
      *
      * Returns [key, value] — which key answered matters when several were watched — or
-     * null when nothing arrived in time. `timeoutSeconds: 0` waits forever, which needs
-     * the connection's timeoutMs to be 0 as well.
+     * null when nothing arrived in time. `timeoutSeconds: 0` waits for ever, and the
+     * deadline this passes for it is none, whatever the connection's own timeoutMs is.
      *
      * @param list<string> $keys
      *

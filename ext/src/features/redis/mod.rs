@@ -8,6 +8,7 @@
 
 pub mod commands;
 pub mod dsn;
+pub mod errors;
 pub mod payloads;
 pub mod pools;
 pub mod scan_state;
@@ -23,18 +24,16 @@ use redis::aio::ConnectionLike;
 use redis::Value;
 
 use crate::dto::Result;
-use crate::errs::Factory;
 use crate::features::{BoxFuture, Feature};
 use crate::helpers::calc_execution_ms;
 use crate::states;
 use crate::states::StateContract;
 use crate::tasks::Task;
 
+use errors::{message as fail, Kind};
 use scan_state::ScanState;
 use subscribe_state::SubscribeState;
 use subscriptions::Subscription;
-
-static ERR_FACTORY: Factory = Factory::new("redis");
 
 /// How many elements a batch carries when the caller names no size.
 const DEFAULT_BATCH_SIZE: usize = 50;
@@ -92,7 +91,7 @@ impl Feature for RedisFeature {
                 Err(error) => {
                     task.add_result(Result::error(
                         message,
-                        ERR_FACTORY.by_err("parse envelope", error),
+                        fail(Kind::Argument, &format!("parse envelope: {error}")),
                     ))
                     .await;
 
@@ -114,7 +113,7 @@ impl Feature for RedisFeature {
                 "sup" => feature.handle_subscription_update(&task, &envelope).await,
                 "suc" => feature.handle_subscription_close(&task, &envelope).await,
                 _ => {
-                    task.add_result(Result::error(message, ERR_FACTORY.by_text("unknown command")))
+                    task.add_result(Result::error(message, fail(Kind::Argument, "unknown command")))
                         .await
                 }
             }
@@ -135,7 +134,7 @@ impl RedisFeature {
             Err(error) => {
                 task.add_result(Result::error(
                     message,
-                    ERR_FACTORY.by_err("parse command params", error),
+                    fail(Kind::Argument, &format!("parse command params: {error}")),
                 ))
                 .await;
 
@@ -146,14 +145,7 @@ impl RedisFeature {
         let name = commands::normalize_name(&params.name);
 
         if name.is_empty() {
-            task.add_result(Result::error(message, ERR_FACTORY.by_text("empty command name")))
-                .await;
-
-            return;
-        }
-
-        if let Some(refusal) = commands::refusal(&name) {
-            task.add_result(Result::error(message, ERR_FACTORY.by_text(&refusal)))
+            task.add_result(Result::error(message, fail(Kind::Argument, "empty command name")))
                 .await;
 
             return;
@@ -162,18 +154,25 @@ impl RedisFeature {
         let args = match values::decode_args(&params.args) {
             Ok(args) => args,
             Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                task.add_result(Result::error(message, fail(Kind::Argument, &error)))
                     .await;
 
                 return;
             }
         };
 
-        let is_blocking = commands::is_blocking(&name, params.blocking);
+        if let Some(refusal) = commands::refusal(&name, &args) {
+            task.add_result(Result::error(message, fail(Kind::Refused, &refusal)))
+                .await;
+
+            return;
+        }
+
+        let is_blocking = commands::is_blocking(&name, &args, params.blocking);
 
         if is_blocking {
             if let Some(error) = deadline_conflict(&name, &args, envelope.timeout_ms) {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                task.add_result(Result::error(message, fail(Kind::Argument, &error)))
                     .await;
 
                 return;
@@ -183,20 +182,27 @@ impl RedisFeature {
         let command = commands::build(&name, &args);
 
         let outcome = if is_blocking {
-            let connection = match pools::get().dedicated(&envelope.dsn).await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
-                        .await;
+            let dsn = envelope.dsn.clone();
 
-                    return;
-                }
-            };
-
-            let mut connection = connection;
-
+            // The dial is inside the deadline, not before it: a caller that asked
+            // for 1500 ms means the whole thing, and a connect that outlives that
+            // is exactly the case where the difference shows.
             run_bounded(task, envelope.timeout_ms, async move {
-                run_one(&mut connection, &command).await
+                let mut dedicated = pools::get()
+                    .dedicated(&dsn)
+                    .await
+                    .map_err(|error| (Kind::Connection, error))?;
+
+                let outcome = run_one(dedicated.connection(), &command).await;
+
+                // A connection whose command the server answered — well or badly
+                // — is clean, and only then is it lent on. One cut off by the
+                // deadline or by a stop never reaches this line at all, because
+                // run_bounded drops this future: that is exactly why the handle
+                // starts unreusable rather than being marked so here.
+                dedicated.keep_if_clean(&outcome);
+
+                outcome
             })
             .await
         } else {
@@ -217,18 +223,15 @@ impl RedisFeature {
             .await
         };
 
-        match outcome {
-            Ok(value) => {
-                task.add_result(Result::success(
-                    message,
-                    values::encode_value(&value),
-                    calc_execution_ms(start_time),
-                ))
-                .await
-            }
-            Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+        match outcome.and_then(|value| {
+            values::encode_value(&value).map_err(|error| (Kind::Command, error))
+        }) {
+            Ok(payload) => {
+                task.add_result(Result::success(message, payload, calc_execution_ms(start_time)))
                     .await
+            }
+            Err((kind, error)) => {
+                task.add_result(Result::error(message, fail(kind, &error))).await
             }
         }
     }
@@ -249,7 +252,7 @@ impl RedisFeature {
             Err(error) => {
                 task.add_result(Result::error(
                     message,
-                    ERR_FACTORY.by_err("parse pipeline params", error),
+                    fail(Kind::Argument, &format!("parse pipeline params: {error}")),
                 ))
                 .await;
 
@@ -258,7 +261,7 @@ impl RedisFeature {
         };
 
         if params.commands.is_empty() {
-            task.add_result(Result::error(message, ERR_FACTORY.by_text("empty pipeline")))
+            task.add_result(Result::error(message, fail(Kind::Argument, "empty pipeline")))
                 .await;
 
             return;
@@ -274,40 +277,44 @@ impl RedisFeature {
             let name = commands::normalize_name(&entry.name);
 
             if name.is_empty() {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text("empty command name")))
+                task.add_result(Result::error(message, fail(Kind::Argument, "empty command name")))
                     .await;
 
                 return;
             }
 
-            if let Some(refusal) = commands::refusal(&name) {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&refusal)))
-                    .await;
-
-                return;
-            }
-
-            if commands::is_blocking(&name, commands::BLOCKING_BY_NAME) {
-                task.add_result(Result::error(
-                    message,
-                    ERR_FACTORY.by_text(&format!(
-                        "{name} waits on the server and cannot run inside a pipeline"
-                    )),
-                ))
-                .await;
-
-                return;
-            }
-
+            // The arguments come first, because both checks below read them: a
+            // refusal can hang on a subcommand, and whether a stream read blocks
+            // is only visible in its BLOCK option.
             let args = match values::decode_args(&entry.args) {
                 Ok(args) => args,
                 Err(error) => {
-                    task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                    task.add_result(Result::error(message, fail(Kind::Argument, &error)))
                         .await;
 
                     return;
                 }
             };
+
+            if let Some(refusal) = commands::refusal(&name, &args) {
+                task.add_result(Result::error(message, fail(Kind::Refused, &refusal)))
+                    .await;
+
+                return;
+            }
+
+            if commands::is_blocking(&name, &args, commands::BLOCKING_BY_NAME) {
+                task.add_result(Result::error(
+                    message,
+                    fail(
+                        Kind::Argument,
+                        &format!("{name} waits on the server and cannot run inside a pipeline"),
+                    ),
+                ))
+                .await;
+
+                return;
+            }
 
             pipeline.add_command(commands::build(&name, &args));
         }
@@ -339,31 +346,47 @@ impl RedisFeature {
             connection
                 .req_packed_commands(&pipeline, offset, count)
                 .await
-                .map_err(|error| values::describe_error(&error))
+                .map_err(|error| values::classify_error(&error))
         })
         .await;
 
         let values = match outcome {
             Ok(values) => values,
-            Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
-                    .await;
+            Err((kind, error)) => {
+                task.add_result(Result::error(message, fail(kind, &error))).await;
 
                 return;
             }
         };
 
-        let payload = if atomic {
+        let encoded = if atomic {
             match values.into_iter().next() {
                 // The transaction was not run: a watched key changed under it.
                 // PHP sees null, which is what EXEC answered.
                 Some(Value::Nil) => values::encode_value(&Value::Nil),
-                Some(Value::Array(replies)) => values::encode_values(&replies),
+                Some(Value::Array(replies)) => values::encode_pipeline(&replies),
+                // EXEC itself failed — a command was refused while it was being
+                // queued, so the server ran none of them.
+                Some(Value::ServerError(error)) => Err(format!(
+                    "{} {}",
+                    error.code(),
+                    error.details().unwrap_or("")
+                )),
                 Some(other) => values::encode_value(&other),
-                None => values::encode_values(&[]),
+                None => values::encode_pipeline(&[]),
             }
         } else {
-            values::encode_values(&values)
+            values::encode_pipeline(&values)
+        };
+
+        let payload = match encoded {
+            Ok(payload) => payload,
+            Err(error) => {
+                task.add_result(Result::error(message, fail(Kind::Command, &error)))
+                    .await;
+
+                return;
+            }
         };
 
         task.add_result(Result::success(message, payload, calc_execution_ms(start_time)))
@@ -380,7 +403,7 @@ impl RedisFeature {
             Err(error) => {
                 task.add_result(Result::error(
                     message,
-                    ERR_FACTORY.by_err("parse scan params", error),
+                    fail(Kind::Argument, &format!("parse scan params: {error}")),
                 ))
                 .await;
 
@@ -393,7 +416,7 @@ impl RedisFeature {
         if !matches!(name.as_str(), "SCAN" | "HSCAN" | "SSCAN" | "ZSCAN") {
             task.add_result(Result::error(
                 message,
-                ERR_FACTORY.by_text(&format!("{name} is not a cursor command")),
+                fail(Kind::Argument, &format!("{name} is not a cursor command")),
             ))
             .await;
 
@@ -403,7 +426,7 @@ impl RedisFeature {
         let args = match values::decode_args(&params.args) {
             Ok(args) => args,
             Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                task.add_result(Result::error(message, fail(Kind::Argument, &error)))
                     .await;
 
                 return;
@@ -423,8 +446,8 @@ impl RedisFeature {
             name,
             args,
             normalize_batch_size(params.batch_size),
+            envelope.timeout_ms,
             task.message_arc(),
-            &ERR_FACTORY,
             acquired,
         ));
 
@@ -436,7 +459,7 @@ impl RedisFeature {
             Err(error) => {
                 state.close().await;
 
-                task.add_result(Result::error(message, ERR_FACTORY.by_err("start scan", error)))
+                task.add_result(Result::error(message, fail(Kind::State, &format!("start scan: {error}"))))
                     .await;
             }
         }
@@ -454,7 +477,7 @@ impl RedisFeature {
             Err(error) => {
                 task.add_result(Result::error(
                     message,
-                    ERR_FACTORY.by_err("parse subscribe params", error),
+                    fail(Kind::Argument, &format!("parse subscribe params: {error}")),
                 ))
                 .await;
 
@@ -465,7 +488,7 @@ impl RedisFeature {
         let channels = match values::decode_args(&params.channels) {
             Ok(channels) => channels,
             Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                task.add_result(Result::error(message, fail(Kind::Argument, &error)))
                     .await;
 
                 return;
@@ -475,7 +498,7 @@ impl RedisFeature {
         let patterns = match values::decode_args(&params.patterns) {
             Ok(patterns) => patterns,
             Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                task.add_result(Result::error(message, fail(Kind::Argument, &error)))
                     .await;
 
                 return;
@@ -485,7 +508,7 @@ impl RedisFeature {
         if channels.is_empty() && patterns.is_empty() {
             task.add_result(Result::error(
                 message,
-                ERR_FACTORY.by_text("a subscription needs at least one channel or pattern"),
+                fail(Kind::Argument, "a subscription needs at least one channel or pattern"),
             ))
             .await;
 
@@ -495,21 +518,32 @@ impl RedisFeature {
         let client = match pools::get().client(&envelope.dsn) {
             Ok(client) => client,
             Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                task.add_result(Result::error(message, fail(Kind::Dsn, &error)))
                     .await;
 
                 return;
             }
         };
 
-        let pubsub = match client.get_async_pubsub().await {
+        // The dial is bounded and cancellable like every other one: get_async_pubsub
+        // takes no configuration of its own, so the bound is applied here or it does
+        // not exist. Without it a subscription to an unreachable host waits on the
+        // kernel, and a stopped flow cannot end it.
+        let dial = tokio::select! {
+            biased;
+
+            _ = task.context().cancelled() => Err((Kind::Stopped, "closed by task stop".to_string())),
+            dial = tokio::time::timeout(pools::connect_timeout(), client.get_async_pubsub()) => match dial {
+                Ok(Ok(pubsub)) => Ok(pubsub),
+                Ok(Err(error)) => Err(values::classify_error(&error)),
+                Err(_) => Err((Kind::Connection, "connect: timed out".to_string())),
+            },
+        };
+
+        let pubsub = match dial {
             Ok(pubsub) => pubsub,
-            Err(error) => {
-                task.add_result(Result::error(
-                    message,
-                    ERR_FACTORY.by_text(&values::describe_error(&error)),
-                ))
-                .await;
+            Err((kind, error)) => {
+                task.add_result(Result::error(message, fail(kind, &error))).await;
 
                 return;
             }
@@ -519,9 +553,18 @@ impl RedisFeature {
 
         let subscription = Arc::new(Subscription::new(sink));
 
-        if let Err(error) = subscription.subscribe(&channels, &patterns).await {
-            task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
-                .await;
+        // Subscribing is a command on the wire, so the payload's deadline covers it
+        // as it covers any other.
+        let subscribed = run_bounded(task, envelope.timeout_ms, async {
+            subscription
+                .subscribe(&channels, &patterns)
+                .await
+                .map_err(|error| (Kind::Connection, error))
+        })
+        .await;
+
+        if let Err((kind, error)) = subscribed {
+            task.add_result(Result::error(message, fail(kind, &error))).await;
 
             return;
         }
@@ -534,7 +577,6 @@ impl RedisFeature {
             stream,
             normalize_batch_size(params.batch_size),
             task.message_arc(),
-            &ERR_FACTORY,
             CancellationToken::new(),
         ));
 
@@ -547,7 +589,7 @@ impl RedisFeature {
 
             task.add_result(Result::error(
                 message,
-                ERR_FACTORY.by_err("register subscription", error),
+                fail(Kind::State, &format!("register subscription: {error}")),
             ))
             .await;
 
@@ -589,7 +631,7 @@ impl RedisFeature {
                 Err(error) => {
                     task.add_result(Result::error(
                         message,
-                        ERR_FACTORY.by_err("parse subscription update params", error),
+                        fail(Kind::Argument, &format!("parse subscription update params: {error}")),
                     ))
                     .await;
 
@@ -600,7 +642,7 @@ impl RedisFeature {
         let Some(subscription) = registry_subscriptions().load(&params.subscription_id) else {
             task.add_result(Result::error(
                 message,
-                ERR_FACTORY.by_text(&format!("unknown subscription {}", params.subscription_id)),
+                fail(Kind::State, &format!("unknown subscription {}", params.subscription_id)),
             ))
             .await;
 
@@ -610,7 +652,7 @@ impl RedisFeature {
         let channels = match values::decode_args(&params.channels) {
             Ok(channels) => channels,
             Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                task.add_result(Result::error(message, fail(Kind::Argument, &error)))
                     .await;
 
                 return;
@@ -620,18 +662,33 @@ impl RedisFeature {
         let patterns = match values::decode_args(&params.patterns) {
             Ok(patterns) => patterns,
             Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
+                task.add_result(Result::error(message, fail(Kind::Argument, &error)))
                     .await;
 
                 return;
             }
         };
 
-        let outcome = match params.operation.as_str() {
-            "add" => subscription.subscribe(&channels, &patterns).await,
-            "rem" => subscription.unsubscribe(&channels, &patterns).await,
-            other => Err(format!("unknown subscription operation {other}")),
-        };
+        // Bounded and cancellable: changing the channels of a subscription is a
+        // command on its connection, and a connection that stopped answering must
+        // not park this task for ever.
+        let outcome = run_bounded(task, envelope.timeout_ms, async {
+            match params.operation.as_str() {
+                "add" => subscription
+                    .subscribe(&channels, &patterns)
+                    .await
+                    .map_err(|error| (Kind::Connection, error)),
+                "rem" => subscription
+                    .unsubscribe(&channels, &patterns)
+                    .await
+                    .map_err(|error| (Kind::Connection, error)),
+                other => Err((
+                    Kind::Argument,
+                    format!("unknown subscription operation {other}"),
+                )),
+            }
+        })
+        .await;
 
         match outcome {
             Ok(()) => {
@@ -642,9 +699,8 @@ impl RedisFeature {
                 ))
                 .await
             }
-            Err(error) => {
-                task.add_result(Result::error(message, ERR_FACTORY.by_text(&error)))
-                    .await
+            Err((kind, error)) => {
+                task.add_result(Result::error(message, fail(kind, &error))).await
             }
         }
     }
@@ -661,7 +717,7 @@ impl RedisFeature {
             Err(error) => {
                 task.add_result(Result::error(
                     message,
-                    ERR_FACTORY.by_err("parse subscription ref", error),
+                    fail(Kind::Argument, &format!("parse subscription ref: {error}")),
                 ))
                 .await;
 
@@ -686,7 +742,7 @@ impl RedisFeature {
     fn acquire(&'static self, envelope: &payloads::Envelope) -> std::result::Result<pools::Acquired, String> {
         pools::get()
             .acquire(&envelope.dsn, envelope.pool_size, envelope.conn_max_lifetime_ms)
-            .map_err(|error| ERR_FACTORY.by_text(&error))
+            .map_err(|error| fail(Kind::Dsn, &error))
     }
 }
 
@@ -696,18 +752,21 @@ impl RedisFeature {
 /// typed query_async is what normally converts them, and it is not on this path
 /// because a pipeline needs those errors kept as values. A single command is the
 /// other case: its failure is the call's failure, and PHP raises it.
-async fn run_one<C>(connection: &mut C, command: &redis::Cmd) -> std::result::Result<Value, String>
+async fn run_one<C>(
+    connection: &mut C,
+    command: &redis::Cmd,
+) -> std::result::Result<Value, (Kind, String)>
 where
     C: ConnectionLike,
 {
     let value = connection
         .req_packed_command(command)
         .await
-        .map_err(|error| values::describe_error(&error))?;
+        .map_err(|error| values::classify_error(&error))?;
 
     value
         .extract_error()
-        .map_err(|error| values::describe_error(&error))
+        .map_err(|error| values::classify_error(&error))
 }
 
 fn encode_subscription_id(subscription_id: &str) -> Vec<u8> {
@@ -756,15 +815,21 @@ fn deadline_conflict(name: &str, args: &[Vec<u8>], timeout_ms: i64) -> Option<St
 
 /// Runs the work under the task deadline and the flow's cancellation. Both are
 /// mandatory for every handler here: the deadline bounds it, the token stops it.
-async fn run_bounded<F, T>(task: &Task, timeout_ms: i64, work: F) -> std::result::Result<T, String>
+async fn run_bounded<F, T>(
+    task: &Task,
+    timeout_ms: i64,
+    work: F,
+) -> std::result::Result<T, (Kind, String)>
 where
-    F: std::future::Future<Output = std::result::Result<T, String>>,
+    F: std::future::Future<Output = std::result::Result<T, (Kind, String)>>,
 {
     tokio::pin!(work);
 
     if timeout_ms <= 0 {
         return tokio::select! {
-            _ = task.context().cancelled() => Err("closed by task stop".to_string()),
+            biased;
+
+            _ = task.context().cancelled() => Err((Kind::Stopped, "closed by task stop".to_string())),
             outcome = &mut work => outcome,
         };
     }
@@ -772,8 +837,13 @@ where
     let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms as u64));
 
     tokio::select! {
-        _ = task.context().cancelled() => Err("closed by task stop".to_string()),
-        _ = deadline => Err(format!("TIMEOUT the command did not answer within {timeout_ms} ms")),
+        biased;
+
+        _ = task.context().cancelled() => Err((Kind::Stopped, "closed by task stop".to_string())),
+        _ = deadline => Err((
+            Kind::Timeout,
+            format!("the command did not answer within {timeout_ms} ms"),
+        )),
         outcome = &mut work => outcome,
     }
 }

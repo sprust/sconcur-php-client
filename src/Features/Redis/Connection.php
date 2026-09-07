@@ -59,7 +59,8 @@ readonly class Connection
      *                                    TLS, unix:///path/to.sock for a socket
      * @param int|null $timeoutMs         deadline for one command, 30000 by default; 0 means
      *                                    no deadline
-     * @param int|null $poolSize          multiplexed connections per process for this dsn
+     * @param int|null $poolSize          multiplexed connections per process for this dsn;
+     *                                    4 by default, 64 at most
      * @param int|null $connMaxLifetimeMs how long a pooled connection is kept before it is
      *                                    replaced; 0 keeps it for the life of the process
      */
@@ -136,9 +137,11 @@ readonly class Connection
     {
         $pipeline = new Pipeline(connection: $this);
 
+        $pipeline->ownByTransaction();
+
         $build($pipeline);
 
-        return $pipeline->execute(atomic: true);
+        return $pipeline->executeAsTransaction();
     }
 
     /**

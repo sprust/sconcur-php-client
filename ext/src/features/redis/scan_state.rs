@@ -6,22 +6,28 @@
 //! and the two are different numbers.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use redis::aio::ConnectionLike;
 use redis::Value;
 
 use crate::dto::{Message, Result};
-use crate::errs::Factory;
 use crate::helpers::calc_execution_ms;
 use crate::states::{StateCloseFuture, StateContract, StateFuture};
 
 use super::commands;
+use super::errors::{message as fail, Kind};
 use super::pools::Acquired;
 use super::values;
 
-type Outcome = std::result::Result<(), String>;
+/// A failure carries the kind PHP raises it as, like everywhere else in the
+/// feature: a deadline is a timeout, a dropped socket is a connection failure,
+/// and only the server's own refusal is a command failure. Flattening them into
+/// one kind is how a scan that ran out of time came back as a
+/// RedisCommandException with no code in it.
+type Outcome = std::result::Result<(), (Kind, String)>;
 
 /// The elements read but not yet handed to PHP, plus what it takes to ask for
 /// more. Behind one mutex, because close() may arrive from a cancelled flow
@@ -42,9 +48,17 @@ pub struct ScanState {
     name: String,
     args: Vec<Vec<u8>>,
     batch_size: usize,
+    /// The deadline one next() may take, from the payload. It bounds the whole
+    /// call rather than one round trip: a MATCH that finds nothing walks the
+    /// keyspace over many round trips, and it is the walk that has to end.
+    timeout_ms: i64,
     message: Arc<Message>,
-    errors: &'static Factory,
     cursor: Mutex<Option<Cursor>>,
+    /// Ends a next() that is in the middle of a walk. Cancelled by close(), so
+    /// the flow going away does not have to wait for the round trip in flight —
+    /// and, more to the point, so close() is not queued behind a walk that could
+    /// last as long as the keyspace does.
+    cancel: CancellationToken,
     start_time: Instant,
 }
 
@@ -53,22 +67,23 @@ impl ScanState {
         name: String,
         args: Vec<Vec<u8>>,
         batch_size: usize,
+        timeout_ms: i64,
         message: Arc<Message>,
-        errors: &'static Factory,
         acquired: Acquired,
     ) -> Self {
         ScanState {
             name,
             args,
             batch_size,
+            timeout_ms,
             message,
-            errors,
             cursor: Mutex::new(Some(Cursor {
                 acquired,
                 cursor: None,
                 buffered: Vec::new(),
                 finished: false,
             })),
+            cancel: CancellationToken::new(),
             start_time: Instant::now(),
         }
     }
@@ -99,26 +114,26 @@ impl ScanState {
         let value = connection
             .req_packed_command(&command)
             .await
-            .map_err(|error| values::describe_error(&error))?;
+            .map_err(|error| values::classify_error(&error))?;
 
         let Value::Array(mut parts) = value else {
-            return Err(format!("{} answered with an unexpected reply", self.name));
+            return Err(self.unexpected("an unexpected reply"));
         };
 
         if parts.len() != 2 {
-            return Err(format!("{} answered with an unexpected reply", self.name));
+            return Err(self.unexpected("an unexpected reply"));
         }
 
         let elements = match parts.pop() {
             Some(Value::Array(elements)) => elements,
-            _ => return Err(format!("{} answered without an element list", self.name)),
+            _ => return Err(self.unexpected("no element list")),
         };
 
         let next_cursor = match parts.pop() {
             Some(Value::BulkString(bytes)) => bytes,
             Some(Value::Int(number)) => number.to_string().into_bytes(),
             Some(Value::SimpleString(text)) => text.into_bytes(),
-            _ => return Err(format!("{} answered without a cursor", self.name)),
+            _ => return Err(self.unexpected("no cursor")),
         };
 
         cursor.finished = next_cursor == b"0";
@@ -127,44 +142,93 @@ impl ScanState {
 
         Ok(())
     }
+
+    /// A reply this side cannot make sense of. It is the server's answer, so it
+    /// is a command failure — the command asked for something the server does not
+    /// answer the way a cursor command answers.
+    fn unexpected(&self, what: &str) -> (Kind, String) {
+        (Kind::Command, format!("{} answered with {what}", self.name))
+    }
+
+    /// One batch: keep asking the server until there is something to hand over
+    /// or the walk is done. An empty answer with a non-zero cursor is normal —
+    /// a MATCH that hits nothing in this slice of the keyspace — and returning
+    /// it to PHP would end the iteration early.
+    async fn pull_batch(&self) -> std::result::Result<Result, (Kind, String)> {
+        let mut guard = self.cursor.lock().await;
+
+        let Some(cursor) = guard.as_mut() else {
+            return Err((Kind::State, "scan is closed".to_string()));
+        };
+
+        while cursor.buffered.is_empty() && !cursor.finished {
+            self.fetch(cursor).await?;
+        }
+
+        let taken = cursor.buffered.len().min(self.batch_size);
+        let batch: Vec<Value> = cursor.buffered.drain(..taken).collect();
+
+        let payload = values::encode_values(&batch).map_err(|error| (Kind::Command, error))?;
+        let has_next = !cursor.buffered.is_empty() || !cursor.finished;
+
+        Ok(if has_next {
+            Result::success_with_next(&self.message, payload, calc_execution_ms(self.start_time))
+        } else {
+            Result::success(&self.message, payload, calc_execution_ms(self.start_time))
+        })
+    }
+}
+
+/// Bounds a batch by the payload's deadline. Zero means the caller asked for
+/// none, and then only the cancellation token ends it.
+async fn with_deadline<F, T>(timeout_ms: i64, work: F) -> std::result::Result<T, (Kind, String)>
+where
+    F: std::future::Future<Output = std::result::Result<T, (Kind, String)>>,
+{
+    if timeout_ms <= 0 {
+        return work.await;
+    }
+
+    match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), work).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err((
+            Kind::Timeout,
+            format!("the scan did not answer within {timeout_ms} ms"),
+        )),
+    }
 }
 
 impl StateContract for ScanState {
     fn next(&self) -> StateFuture<'_> {
         Box::pin(async move {
-            let mut guard = self.cursor.lock().await;
+            // Both mandatory requirements of a handler apply to a batch as much as
+            // to a one-shot command: the deadline bounds it and the token ends it.
+            // The token is checked first, so a cancelled stream answers at once
+            // instead of after one more round trip.
+            let outcome = tokio::select! {
+                biased;
 
-            let Some(cursor) = guard.as_mut() else {
-                return Result::error(&self.message, self.errors.by_text("scan is closed"));
+                _ = self.cancel.cancelled() => Err((
+                    Kind::Stopped,
+                    "closed by task stop".to_string(),
+                )),
+                outcome = with_deadline(self.timeout_ms, self.pull_batch()) => outcome,
             };
 
-            // An empty batch is not the end of a scan: the server may answer a
-            // whole round trip with no elements and a non-zero cursor, and
-            // returning that to PHP would end the iteration early. Keep asking
-            // until there is something to hand over or the cursor comes back to
-            // zero.
-            while cursor.buffered.is_empty() && !cursor.finished {
-                if let Err(error) = self.fetch(cursor).await {
-                    return Result::error(&self.message, self.errors.by_text(&error));
-                }
-            }
-
-            let taken = cursor.buffered.len().min(self.batch_size);
-            let batch: Vec<Value> = cursor.buffered.drain(..taken).collect();
-
-            let payload = values::encode_values(&batch);
-            let has_next = !cursor.buffered.is_empty() || !cursor.finished;
-
-            if has_next {
-                Result::success_with_next(&self.message, payload, calc_execution_ms(self.start_time))
-            } else {
-                Result::success(&self.message, payload, calc_execution_ms(self.start_time))
+            match outcome {
+                Ok(result) => result,
+                Err((kind, error)) => Result::error(&self.message, fail(kind, &error)),
             }
         })
     }
 
     fn close(&self) -> StateCloseFuture<'_> {
         Box::pin(async move {
+            // Cancel before reaching for the mutex: a next() in the middle of a
+            // long walk holds it, and close() waiting for that walk to end is
+            // exactly what a flow being stopped must not do.
+            self.cancel.cancel();
+
             // Dropping the cursor releases the pooled connection. Taking it out
             // of the mutex means a second close finds nothing to do rather than
             // releasing twice.

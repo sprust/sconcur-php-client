@@ -54,21 +54,33 @@ new Connection(
 | `poolSize` | multiplexed connections per process for this dsn; 4 by default, 64 at most |
 | `connMaxLifetimeMs` | how long a pooled connection is kept before it is replaced; `0` keeps it for the life of the process |
 
-The only query parameter a TCP dsn takes is `protocol=2|3`; a unix-socket dsn
-also takes `db`, `user` and `pass`, which have nowhere else to go there. Any
-other parameter is refused with `InvalidRedisDsnException` rather than ignored —
-a parameter read by nothing means the connection does not behave the way the
+The only query parameter a TCP dsn takes is `protocol`; a unix-socket dsn also
+takes `db`, `user` and `pass`, which have nowhere else to go there. Any other
+parameter is refused with `InvalidRedisDsnException` rather than ignored — a
+parameter read by nothing means the connection does not behave the way the
 configuration says it does.
+
+`protocol=3` (RESP3) is refused too. It changes the reply shape of several
+commands — `HGETALL` answers a map rather than a flat list, a scored range
+answers pairs — and the typed methods below are written against RESP2. Accepting
+it would hand them a shape they read wrongly and quietly.
 
 The object owns no socket. Connections live in the extension, keyed by the dsn
 and the sizing, and an unused pool is closed five minutes after its last command.
 
-`timeoutMs` is the only deadline over a command. The driver's own per-command
-timeout is turned off deliberately: it defaults to 500 ms, which would cut off
-every blocking command by design and every slow one by accident. Dialling is the
-one exception — it is bounded at five seconds, because the reconnect that runs
+`timeoutMs` is the deadline over a command and over a cursor batch. Subscribing
+is bounded by the dial timeout below rather than by it, because a subscription
+waits for messages that may never come and the connection's own deadline is not
+the right bound for that. The driver's per-command timeout is turned off
+deliberately: it defaults to 500 ms, which would cut off every blocking command
+by design and every slow one by accident.
+
+Dialling is bounded separately, at five seconds, because the reconnect that runs
 behind the commands has nobody's deadline over it and an attempt against a host
-that swallows packets has to end by itself.
+that swallows packets has to end by itself. A connection that cannot be made is
+re-tried twice and then reported: a wrong password or a closed port arrives as
+`RedisConnectionException`, not as a deadline that says nothing about what is
+wrong.
 
 ## Values are bytes
 
@@ -95,11 +107,8 @@ A reply arrives in the shape the server sent it:
 | array | `list<mixed>` |
 | error | an exception (or `Dto\ErrorReply` inside a pipeline) |
 
-With `?protocol=3` the server may also answer with a double (`float`), a boolean
-(`bool`), a map (associative array) or a set (list). RESP3 changes the reply
-shape of several commands — `HGETALL` becomes a map rather than a flat list — so
-it changes what your code reads. That is Redis, not this feature; the typed
-methods below cope with both.
+The protocol is RESP2. See the dsn section for why RESP3 is refused rather than
+half-supported.
 
 ## The typed methods
 
@@ -120,9 +129,10 @@ shapes the reply or assembles options whose order is easy to get wrong:
 - scripts: `eval`, `evalSha`, `scriptLoad`
 - server: `ping`, `dbSize`, `info`, `flushDb`
 
-Three of them return something the server did not: `hGetAll` and
-`zRange(withScores: true)` fold the flat reply into a map, and `mGet`/`hMGet`
-key their answers by what was asked for instead of by position. `ttl` answers
+Some of them return something the server did not: `hGetAll`,
+`zRange(withScores: true)` and `zRangeByScore(withScores: true)` fold the flat
+reply into a map, and `mGet`/`hMGet` key their answers by what was asked for
+instead of by position (so a key asked for twice appears once). `ttl` answers
 `null` for a key without an expiry and `false` for a key that is not there,
 because Redis says `-1` and `-2` and both read like a duration.
 
@@ -145,6 +155,9 @@ A failed command does not fail the batch — the server ran the others, and thei
 results are not worth throwing away over one typo. The failure takes its own
 place in the list as a `Dto\ErrorReply` carrying the code and the message.
 
+A send that never reached the server leaves the pipeline as it was, so retrying
+it is retrying the same commands.
+
 ```php
 $replies = $redis->transaction(static function (Pipeline $transaction): void {
     $transaction->command('INCRBY', ['counter', 1]);
@@ -154,7 +167,13 @@ $replies = $redis->transaction(static function (Pipeline $transaction): void {
 
 `transaction()` wraps the batch in `MULTI`/`EXEC`: the server runs it as one unit
 with nothing in between. The callback cannot read anything as it goes — a
-transaction's replies all arrive after `EXEC`.
+transaction's replies all arrive after `EXEC` — and calling `execute()` inside it
+is refused, because those commands would go out on their own, outside the
+transaction, with their replies dropped.
+
+A command the server refuses while queueing aborts the whole transaction:
+`EXEC` answers `EXECABORT` and none of it runs. That is the difference from a
+plain pipeline, where the other commands run around the bad one.
 
 Commands are written raw inside a pipeline, with `command()` alone. The typed
 methods reshape the reply of the command they name, and a pipeline hands back a
@@ -183,10 +202,18 @@ is refused rather than cutting the wait short:
 $redis->command('BLPOP', ['queue', 5], blocking: true, timeoutMs: 6000);
 ```
 
-`blocking: true` is only needed where the command name does not say: `XREAD` and
-`XREADGROUP` wait when the arguments carry `BLOCK` and not otherwise. Everything
-in the list below is recognised by name — `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`,
-`BRPOPLPUSH`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `WAIT`, `WAITAOF`.
+You rarely need `blocking: true`. `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`,
+`BRPOPLPUSH`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `WAIT` and `WAITAOF` are
+recognised by name, and `XREAD`/`XREADGROUP` by the `BLOCK` option in their
+arguments. The flag is there for a command whose waiting neither of those can
+see, and `blocking: false` forces a command onto the shared pool — which is a
+way to stall it, and exists for the tests that prove that.
+
+A connection taken for a blocking command is given back when the command ends,
+so a consumer loop does not pay a handshake per iteration; one cut off by a
+deadline or a stop is given up instead, because it is still owed an answer. One
+dsn holds at most 64 of them at once, and asking for the sixty-fifth fails
+rather than opening it.
 
 Waiting forever (`timeoutSeconds: 0`) is only coherent with `timeoutMs: 0`. Such
 a command is still stopped by the flow ending.
@@ -217,7 +244,9 @@ least once, one added or removed along the way may or may not appear, and
 duplicates are possible. That is Redis, not this feature.
 
 Abandoning the iterator early is safe — the flow ends, and the cursor and its
-connection are released with it.
+connection are released with it. Iterating the same result a second time inside a
+coroutine opens a second cursor and leaves the first to that release, so a loop
+that re-scans repeatedly should call `scan()` again instead.
 
 ## Pub/Sub
 
@@ -256,16 +285,23 @@ which is not supported either.
 | Exception | When |
 | --- | --- |
 | `RedisCommandException` | the server refused the command; `errorCode` holds `WRONGTYPE`, `NOSCRIPT`, `MOVED`, `LOADING`, … |
-| `RedisConnectionException` | the server is unreachable, the login was refused, or the socket went away mid-command |
+| `RedisConnectionException` | the server is unreachable, the login was refused, the socket went away mid-command, or the flow was stopped under the command |
 | `RedisTimeoutException` | `timeoutMs` ran out |
-| `SubscriptionClosedException` | a subscription was used after it was closed |
+| `SubscriptionClosedException` | a subscription or a cursor was used after it was closed |
+| `RedisTimeoutException` | a cursor batch ran past `timeoutMs` |
 | `UnsupportedRedisCommandException` | a command that would change the state of a shared connection |
-| `InvalidRedisArgumentException` | an argument that is not a string, an int or a float |
+| `InvalidRedisArgumentException` | an argument that is not a string, an int or a float, or a payload this side could not use |
+| `NestedPipelineExecutionException` | `execute()` called inside a `transaction()` callback |
 | `InvalidRedisDsnException` | an unusable dsn |
 
-The last three extend `LogicException` — they are usage mistakes, not conditions
+The last four extend `LogicException` — they are usage mistakes, not conditions
 of the server — and the rest extend `RedisException`, itself a
 `RuntimeException`.
+
+Which one a failure becomes is decided by the core and travels with it, not
+guessed from the message: half of an error's text belongs to the server, and a
+Lua script answering `redis.error_reply('connect: ...')` must not be able to pick
+the exception an application catches.
 
 A connection that drops is re-established behind the commands, but a command
 that was in flight when it happened fails, and nothing is retried on its own: the
@@ -280,12 +316,29 @@ connections. Each is refused by name, with the replacement in the message:
 | Command | Instead |
 | --- | --- |
 | `SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE` | `subscribe()` and the subscription's own methods |
+| `QUIT` | nothing — it would close a socket other coroutines are using |
+| `CLIENT REPLY`, `SETNAME`, `SETINFO`, `NO-TOUCH`, `NO-EVICT`, `PAUSE`, `UNPAUSE` | nothing; the read-only rest of `CLIENT` (`LIST`, `INFO`, `ID`) is allowed |
 | `SSUBSCRIBE`, `SUNSUBSCRIBE` | not supported |
 | `MULTI`, `EXEC`, `DISCARD` | `transaction()` |
 | `WATCH`, `UNWATCH` | not supported |
 | `SELECT` | the database number in the dsn |
 | `AUTH`, `HELLO` | the login, password and `?protocol=` in the dsn |
 | `RESET`, `MONITOR`, `SWAPDB` | nothing — these would change what every other coroutine on that socket is talking to |
+
+`CLIENT REPLY OFF|SKIP` is the worst of them and the reason the list checks
+subcommands: it tells the server not to answer, and an answer that never comes
+shifts the connection's queue by one for good. Nothing errors, so nothing
+reconnects, and every later command on that connection reads the previous one's
+reply.
+
+A blocking command inside a pipeline is refused too — a pipeline is one unit on
+one connection, and a wait inside it would park the batch.
+
+`CLIENT KILL` is allowed and is not harmless: killing this process's own
+connections makes one command per killed connection fail before the pool
+re-establishes them. It is allowed because it is how a connection is killed at
+all, not because it is safe. `DEBUG SLEEP` and a synchronous `FLUSHALL` are
+allowed for the same reason and stall the whole server while they run.
 
 ## Limits
 
@@ -313,4 +366,5 @@ connections. Each is refused by name, with the replacement in the message:
   anything else, so it cannot be shared. RESP3 lifts that restriction, and using
   it to put subscriptions back on the shared pool is the obvious next step, not a
   thing this version does.
+- **RESP2 only.** See the dsn section.
 - The library's general limits are in the [README](../README.md).

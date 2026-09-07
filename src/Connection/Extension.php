@@ -343,7 +343,12 @@ class Extension
 
             return new TaskResultDto(
                 flowKey: $flowKey,
-                method: MethodEnum::from($method),
+                // tryFrom, because a frame the core builds without a method — the
+                // "state not started" error answers with Method::Unknown, whose
+                // wire value is empty — would otherwise throw here instead of
+                // reaching the caller as the failure it is, and the caller would
+                // see a ValueError about an enum rather than what went wrong.
+                method: MethodEnum::tryFrom($method) ?? MethodEnum::Unknown,
                 key: $taskKey,
                 isError: ($header['flags'] & self::FRAME_FLAG_ERROR) !== 0,
                 payload: $payload,

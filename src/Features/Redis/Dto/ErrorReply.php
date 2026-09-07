@@ -11,7 +11,7 @@ namespace SConcur\Features\Redis\Dto;
  * failed command takes its own place in the list instead of failing the whole call. A
  * single command outside a pipeline throws, like every other call in the library.
  *
- * Rust: values::encode_error_reply (ext/src/features/redis/values.rs).
+ * Rust: values::encode_pipeline (ext/src/features/redis/values.rs).
  */
 readonly class ErrorReply
 {

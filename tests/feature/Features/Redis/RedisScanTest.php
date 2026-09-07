@@ -102,6 +102,31 @@ class RedisScanTest extends BaseTestCase
         self::assertSame(['a' => 1.0, 'b' => 2.5], $seen);
     }
 
+    public function testIteratingWithoutRewindingDoesNotSpin(): void
+    {
+        $this->connection->mSet(['a' => '1', 'b' => '2']);
+
+        $result = $this->connection->scan();
+
+        // PHP's iterator contract says nothing about this order, but "undefined"
+        // must not mean "spins for ever with no I/O in it": that is a worker nothing
+        // can interrupt — no deadline, no coroutine switch, no flow stop.
+        self::assertFalse($result->valid());
+
+        $result->next();
+
+        self::assertFalse($result->valid());
+
+        // And it still works when used properly.
+        $seen = 0;
+
+        foreach ($result as $ignored) {
+            ++$seen;
+        }
+
+        self::assertSame(2, $seen);
+    }
+
     public function testAnAbandonedScanLeavesNothingBehind(): void
     {
         $pipeline = $this->connection->pipeline();
@@ -115,11 +140,20 @@ class RedisScanTest extends BaseTestCase
         foreach ($this->connection->scan(match: 'abandon:*', count: 10, batchSize: 5) as $key) {
             self::assertNotSame('', $key);
 
-            // Walk away with the cursor open. The flow ending has to close it; the
-            // dangling-task check in tearDown is what proves it did.
+            // Walk away with the cursor open. The flow ending has to close it and
+            // give its pooled connection back.
             break;
         }
 
-        self::assertTrue($this->connection->ping());
+        // The cursor rode a pooled connection, so counting sockets proves nothing.
+        // What an unreleased one would cost is that connection: a full scan
+        // afterwards has to walk the whole keyspace on the pool that is left.
+        $seen = 0;
+
+        foreach ($this->connection->scan(match: 'abandon:*', count: 100) as $ignored) {
+            ++$seen;
+        }
+
+        self::assertSame(500, $seen, 'the pool did not recover from the abandoned cursor');
     }
 }

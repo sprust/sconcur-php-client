@@ -6,6 +6,7 @@ namespace SConcur\Tests\Feature\Features\Redis;
 
 use SConcur\Features\Redis\Connection;
 use SConcur\Features\Redis\Dto\Message;
+use SConcur\Features\Sleeper\Sleeper;
 use SConcur\Scheduler\Scheduler;
 use SConcur\Tests\Feature\BaseTestCase;
 use SConcur\Tests\Impl\TestRedisResolver;
@@ -161,5 +162,105 @@ class RedisSubscribeTest extends BaseTestCase
         );
 
         $waitGroup->waitAll();
+    }
+
+    public function testClosingASubscriptionReleasesEverythingItHeld(): void
+    {
+        // The path the documentation recommends, and the one that leaked: close()
+        // told the core to let go and then skipped releasing the flow this side
+        // owned, while the core's own cleanup waited on a flow that close() never
+        // ended. Only the abandoned path was correct.
+        $this->connection->ping();
+
+        $baseline = TestRedisResolver::countServerConnections();
+
+        for ($round = 0; $round < 8; ++$round) {
+            $subscription = $this->connection->subscribe(channels: ["closed:$round"]);
+
+            $subscription->close();
+        }
+
+        self::assertLessThanOrEqual(
+            $baseline + 2,
+            TestRedisResolver::countServerConnections(),
+            'closing subscriptions did not release their connections',
+        );
+    }
+
+    public function testReadFollowedByIterationDoesNotDeliverTheSameMessageTwice(): void
+    {
+        $received = [];
+
+        $waitGroup = WaitGroup::create();
+
+        $waitGroup->add(
+            callback: function () use (&$received): void {
+                $subscription = $this->connection->subscribe(channels: ['once']);
+
+                $published = false;
+
+                Scheduler::get()->spawn(
+                    callback: function () use (&$published): void {
+                        $this->connection->command('PUBLISH', ['once', 'first']);
+                        $this->connection->command('PUBLISH', ['once', 'second']);
+
+                        $published = true;
+                    },
+                );
+
+                $received[] = $subscription->read()?->payload;
+
+                foreach ($subscription as $message) {
+                    $received[] = $message->payload;
+
+                    break;
+                }
+
+                $subscription->close();
+
+                // The publisher is a spawned coroutine, so the group does not wait
+                // for it; a message read is not the same moment as the publish that
+                // sent it having finished.
+                while (!$published) {
+                    Sleeper::usleep(microseconds: 1000);
+                }
+            },
+        );
+
+        $waitGroup->waitAll();
+
+        // A subscriber doing the work twice is the whole cost of a duplicate.
+        self::assertSame(['first', 'second'], $received);
+    }
+
+    public function testAPatternSubscriptionIsToldApartFromAPlainOne(): void
+    {
+        // The core says which it is; inferring it from the pattern being empty is
+        // wrong for a subscription to the empty pattern, which is legal.
+        $messages = [];
+
+        $waitGroup = WaitGroup::create();
+
+        $waitGroup->add(
+            callback: function () use (&$messages): void {
+                $subscription = $this->connection->subscribe(channels: ['plain']);
+
+                Scheduler::get()->spawn(
+                    callback: function (): void {
+                        $this->connection->command('PUBLISH', ['plain', 'body']);
+                    },
+                );
+
+                $messages[] = $subscription->read();
+
+                $subscription->close();
+            },
+        );
+
+        $waitGroup->waitAll();
+
+        self::assertInstanceOf(Message::class, $messages[0]);
+        self::assertFalse($messages[0]->fromPattern());
+        self::assertSame('', $messages[0]->pattern);
     }
 }

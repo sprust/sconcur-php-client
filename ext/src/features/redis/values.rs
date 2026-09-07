@@ -4,35 +4,85 @@
 //! arbitrary bytes, and declaring them UTF-8 breaks on the first compressed
 //! blob somebody stored.
 
-use redis::{ErrorKind, RedisError, Value};
-use rmp::encode;
+use redis::{ErrorKind, RedisError, ServerError, Value};
 
-/// The key an error reply carries inside a pipeline answer, and the marker that
-/// tells the PHP side this map is an error rather than a value a command
-/// returned. PHP: SConcur\Features\Redis\Dto\ErrorReply.
-const ERROR_MARKER_KEY: &str = "__sconcur_redis_error";
+use super::errors::Kind;
+use rmp::encode;
 
 /// Encodes one reply. The command is not consulted: what the server sent is
 /// what crosses, and shaping a reply into something friendlier is the PHP
 /// facade's job, where it is visible in the method that does it.
-pub fn encode_value(value: &Value) -> Vec<u8> {
+///
+/// Fallible, because `Value` is non_exhaustive: a variant a later redis-rs adds
+/// must fail loudly rather than cross as nil and be read as a missing key.
+pub fn encode_value(value: &Value) -> std::result::Result<Vec<u8>, String> {
     let mut buffer = Vec::new();
 
-    write_value(&mut buffer, value);
+    write_value(&mut buffer, value)?;
 
-    buffer
+    Ok(buffer)
 }
 
-/// Encodes a list of replies — the answer to a pipeline.
-pub fn encode_values(values: &[Value]) -> Vec<u8> {
+/// Encodes a list of replies — the elements of one batch.
+pub fn encode_values(values: &[Value]) -> std::result::Result<Vec<u8>, String> {
     let mut buffer = Vec::new();
 
-    write_array(&mut buffer, values);
+    write_array(&mut buffer, values)?;
 
-    buffer
+    Ok(buffer)
 }
 
-fn write_value(buffer: &mut Vec<u8>, value: &Value) {
+/// The answer to a pipeline: the replies, plus the failures by the position of
+/// the command that caused them.
+///
+/// The failures travel beside the replies rather than inside them. They used to
+/// be a marked map in the reply's own place, and that was forgeable: a hash with
+/// a field named after the marker decoded into exactly the same shape, so a
+/// value somebody had stored could come back to PHP as an error object.
+pub fn encode_pipeline(values: &[Value]) -> std::result::Result<Vec<u8>, String> {
+    let mut errors: Vec<(usize, &ServerError)> = Vec::new();
+
+    for (index, value) in values.iter().enumerate() {
+        if let Value::ServerError(error) = value {
+            errors.push((index, error));
+        }
+    }
+
+    let mut buffer = Vec::new();
+
+    let _ = encode::write_map_len(&mut buffer, 2);
+
+    let _ = encode::write_str(&mut buffer, "r");
+    let _ = encode::write_array_len(&mut buffer, values.len() as u32);
+
+    for value in values {
+        // A failed command has no reply; nil holds its place so the list still
+        // lines up with the commands that were sent.
+        match value {
+            Value::ServerError(_) => {
+                let _ = encode::write_nil(&mut buffer);
+            }
+            other => write_value(&mut buffer, other)?,
+        }
+    }
+
+    let _ = encode::write_str(&mut buffer, "e");
+    let _ = encode::write_map_len(&mut buffer, errors.len() as u32);
+
+    for (index, error) in errors {
+        let _ = encode::write_uint(&mut buffer, index as u64);
+
+        let _ = encode::write_map_len(&mut buffer, 2);
+        let _ = encode::write_str(&mut buffer, "c");
+        let _ = encode::write_str(&mut buffer, error.code());
+        let _ = encode::write_str(&mut buffer, "m");
+        let _ = encode::write_str(&mut buffer, error.details().unwrap_or(""));
+    }
+
+    Ok(buffer)
+}
+
+fn write_value(buffer: &mut Vec<u8>, value: &Value) -> std::result::Result<(), String> {
     match value {
         Value::Nil => {
             let _ = encode::write_nil(buffer);
@@ -45,13 +95,13 @@ fn write_value(buffer: &mut Vec<u8>, value: &Value) {
         // The status reply of SET, DEL and the rest. PHP sees the string every
         // other client shows, rather than a boolean this side invented.
         Value::Okay => write_bin(buffer, b"OK"),
-        Value::Array(items) | Value::Set(items) => write_array(buffer, items),
+        Value::Array(items) | Value::Set(items) => write_array(buffer, items)?,
         Value::Map(pairs) => {
             let _ = encode::write_map_len(buffer, pairs.len() as u32);
 
             for (key, item) in pairs {
-                write_value(buffer, key);
-                write_value(buffer, item);
+                write_value(buffer, key)?;
+                write_value(buffer, item)?;
             }
         }
         Value::Double(number) => {
@@ -67,45 +117,38 @@ fn write_value(buffer: &mut Vec<u8>, value: &Value) {
         Value::BigNumber(digits) => write_bin(buffer, digits),
         // An attribute is metadata attached to a reply; the reply is what the
         // caller asked for.
-        Value::Attribute { data, .. } => write_value(buffer, data),
-        Value::Push { data, .. } => write_array(buffer, data),
+        Value::Attribute { data, .. } => write_value(buffer, data)?,
+        Value::Push { data, .. } => write_array(buffer, data)?,
+        // Reached only where a server error is nested inside another reply. The
+        // single-command path lifts a top-level one into the call's failure, and
+        // the pipeline path takes them out before encoding.
         Value::ServerError(error) => {
-            let detail = error.details().unwrap_or("").to_string();
-
-            write_error_reply(buffer, error.code(), &detail);
+            return Err(format!(
+                "{} {}",
+                error.code(),
+                error.details().unwrap_or("")
+            ));
         }
         // Value is non_exhaustive: a variant added by a later redis-rs must not
-        // silently become nil, so it crosses as an error reply naming itself.
-        _ => write_error_reply(buffer, "ERR", "unsupported reply type"),
+        // silently become nil, which PHP would read as a missing key.
+        other => return Err(format!("unsupported reply type: {other:?}")),
     }
+
+    Ok(())
 }
 
-fn write_array(buffer: &mut Vec<u8>, items: &[Value]) {
+fn write_array(buffer: &mut Vec<u8>, items: &[Value]) -> std::result::Result<(), String> {
     let _ = encode::write_array_len(buffer, items.len() as u32);
 
     for item in items {
-        write_value(buffer, item);
+        write_value(buffer, item)?;
     }
+
+    Ok(())
 }
 
 fn write_bin(buffer: &mut Vec<u8>, bytes: &[u8]) {
     let _ = encode::write_bin(buffer, bytes);
-}
-
-/// The failure of one command inside a pipeline: the rest of the pipeline ran, so
-/// it travels as a value in its place rather than failing the whole answer.
-/// PHP: SConcur\Features\Redis\Dto\ErrorReply.
-fn write_error_reply(buffer: &mut Vec<u8>, code: &str, message: &str) {
-    let _ = encode::write_map_len(buffer, 3);
-
-    let _ = encode::write_str(buffer, ERROR_MARKER_KEY);
-    let _ = encode::write_bool(buffer, true);
-
-    let _ = encode::write_str(buffer, "code");
-    let _ = encode::write_str(buffer, code);
-
-    let _ = encode::write_str(buffer, "message");
-    let _ = encode::write_str(buffer, message);
 }
 
 /// One command argument, as the bytes it goes on the wire as.
@@ -127,20 +170,34 @@ pub fn decode_args(values: &[rmpv::Value]) -> Result<Vec<Vec<u8>>, String> {
     values.iter().map(decode_arg).collect()
 }
 
-/// A driver error as the text PHP parses back into an exception. The Redis
-/// error code leads, so the PHP side reads it off the first word instead of
-/// matching the whole message with a pattern.
-pub fn describe_error(error: &RedisError) -> String {
-    let code = error.code().unwrap_or_else(|| match error.kind() {
-        ErrorKind::Io => "IOERR",
-        ErrorKind::AuthenticationFailed => "NOAUTH",
-        _ => "ERR",
-    });
+/// A driver failure, as the kind PHP raises it and the text that goes with it.
+///
+/// The kind is decided here, from the driver's own typed error, and never from
+/// the message: a Lua script can answer whatever it likes, and classifying that
+/// text would let it choose the exception the application catches.
+pub fn classify_error(error: &RedisError) -> (Kind, String) {
+    if let Some(code) = error.code() {
+        let detail = error.detail().unwrap_or("").to_string();
 
-    match error.detail() {
-        Some(detail) => format!("{code} {detail}"),
-        None => format!("{code} {error}"),
+        // NOAUTH and WRONGPASS are the server saying the connection is not
+        // usable, not that this command was wrong.
+        let kind = match code {
+            "NOAUTH" | "WRONGPASS" => Kind::Connection,
+            _ => Kind::Command,
+        };
+
+        return (kind, format!("{code} {detail}").trim_end().to_string());
     }
+
+    let kind = match error.kind() {
+        ErrorKind::Io | ErrorKind::AuthenticationFailed => Kind::Connection,
+        ErrorKind::InvalidClientConfig => Kind::Dsn,
+        _ if error.is_timeout() => Kind::Timeout,
+        _ if error.is_connection_dropped() || error.is_connection_refusal() => Kind::Connection,
+        _ => Kind::Command,
+    };
+
+    (kind, error.to_string())
 }
 
 #[cfg(test)]
@@ -152,21 +209,23 @@ mod tests {
         read_value(&mut &bytes[..]).expect("the encoder wrote valid MessagePack")
     }
 
+    fn encoded(value: &Value) -> rmpv::Value {
+        decode(&encode_value(value).expect("the value is encodable"))
+    }
+
     #[test]
     fn nil_becomes_nil() {
-        assert_eq!(decode(&encode_value(&Value::Nil)), rmpv::Value::Nil);
+        assert_eq!(encoded(&Value::Nil), rmpv::Value::Nil);
     }
 
     #[test]
     fn an_integer_stays_an_integer() {
-        assert_eq!(decode(&encode_value(&Value::Int(-42))), rmpv::Value::from(-42));
+        assert_eq!(encoded(&Value::Int(-42)), rmpv::Value::from(-42));
     }
 
     #[test]
     fn a_bulk_string_crosses_as_binary() {
-        let encoded = encode_value(&Value::BulkString(vec![0x00, 0xff, b'a']));
-
-        match decode(&encoded) {
+        match encoded(&Value::BulkString(vec![0x00, 0xff, b'a'])) {
             rmpv::Value::Binary(bytes) => assert_eq!(bytes, vec![0x00, 0xff, b'a']),
             other => panic!("expected binary, got {other:?}"),
         }
@@ -174,7 +233,7 @@ mod tests {
 
     #[test]
     fn okay_crosses_as_the_status_string() {
-        match decode(&encode_value(&Value::Okay)) {
+        match encoded(&Value::Okay) {
             rmpv::Value::Binary(bytes) => assert_eq!(bytes, b"OK".to_vec()),
             other => panic!("expected binary, got {other:?}"),
         }
@@ -187,7 +246,7 @@ mod tests {
             Value::Array(vec![Value::BulkString(b"inner".to_vec()), Value::Nil]),
         ]);
 
-        match decode(&encode_value(&value)) {
+        match encoded(&value) {
             rmpv::Value::Array(items) => {
                 assert_eq!(items.len(), 2);
 
@@ -204,7 +263,7 @@ mod tests {
     fn a_map_crosses_as_a_map() {
         let value = Value::Map(vec![(Value::BulkString(b"k".to_vec()), Value::Int(7))]);
 
-        match decode(&encode_value(&value)) {
+        match encoded(&value) {
             rmpv::Value::Map(pairs) => assert_eq!(pairs.len(), 1),
             other => panic!("expected a map, got {other:?}"),
         }
@@ -212,37 +271,108 @@ mod tests {
 
     #[test]
     fn resp3_scalars_keep_their_types() {
-        assert_eq!(decode(&encode_value(&Value::Double(1.5))), rmpv::Value::from(1.5));
-        assert_eq!(decode(&encode_value(&Value::Boolean(true))), rmpv::Value::from(true));
+        assert_eq!(encoded(&Value::Double(1.5)), rmpv::Value::from(1.5));
+        assert_eq!(encoded(&Value::Boolean(true)), rmpv::Value::from(true));
     }
 
     #[test]
-    fn an_error_reply_is_a_marked_map() {
-        let mut buffer = Vec::new();
+    fn a_nested_server_error_fails_the_encoding() {
+        // Rather than crossing as some value PHP would read as data.
+        let value = Value::Array(vec![Value::Int(1), server_error()]);
 
-        write_error_reply(&mut buffer, "WRONGTYPE", "wrong kind of value");
+        assert!(encode_value(&value).is_err());
+    }
 
-        match decode(&buffer) {
+    #[test]
+    fn a_pipeline_answer_carries_replies_and_failures_apart() {
+        let values = vec![Value::Okay, server_error(), Value::Int(3)];
+
+        let decoded = decode(&encode_pipeline(&values).expect("encodable"));
+
+        let rmpv::Value::Map(fields) = decoded else {
+            panic!("expected a map");
+        };
+
+        let replies = fields
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("r"))
+            .map(|(_, value)| value)
+            .expect("the replies are there");
+
+        let errors = fields
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("e"))
+            .map(|(_, value)| value)
+            .expect("the failures are there");
+
+        match replies {
+            rmpv::Value::Array(items) => {
+                assert_eq!(items.len(), 3);
+                // The failed command holds its place, so the list still lines up
+                // with the commands that were sent.
+                assert_eq!(items[1], rmpv::Value::Nil);
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+
+        match errors {
             rmpv::Value::Map(pairs) => {
-                assert_eq!(pairs.len(), 3);
-
-                let has_marker = pairs
-                    .iter()
-                    .any(|(key, _)| key.as_str() == Some(ERROR_MARKER_KEY));
-
-                assert!(has_marker, "the marker key must be present");
+                assert_eq!(pairs.len(), 1);
+                assert_eq!(pairs[0].0.as_u64(), Some(1));
             }
             other => panic!("expected a map, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_pipeline_answer_is_a_list() {
-        let encoded = encode_values(&[Value::Int(1), Value::Nil]);
+    fn a_pipeline_without_failures_says_so() {
+        let decoded = decode(&encode_pipeline(&[Value::Int(1)]).expect("encodable"));
 
-        match decode(&encoded) {
-            rmpv::Value::Array(items) => assert_eq!(items.len(), 2),
-            other => panic!("expected an array, got {other:?}"),
+        let rmpv::Value::Map(fields) = decoded else {
+            panic!("expected a map");
+        };
+
+        let errors = fields
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("e"))
+            .map(|(_, value)| value)
+            .expect("the failures field is always there");
+
+        match errors {
+            rmpv::Value::Map(pairs) => assert!(pairs.is_empty()),
+            other => panic!("expected a map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_value_cannot_forge_a_failure() {
+        // The old encoding marked a failure with a magic key inside the reply
+        // itself, so a hash carrying that field came back to PHP as an error
+        // object. Failures travel beside the replies now, and a map that looks
+        // like one is still just a map.
+        let value = Value::Map(vec![
+            (
+                Value::BulkString(b"__sconcur_redis_error".to_vec()),
+                Value::BulkString(b"1".to_vec()),
+            ),
+            (Value::BulkString(b"code".to_vec()), Value::BulkString(b"BOOM".to_vec())),
+        ]);
+
+        let decoded = decode(&encode_pipeline(&[value]).expect("encodable"));
+
+        let rmpv::Value::Map(fields) = decoded else {
+            panic!("expected a map");
+        };
+
+        let errors = fields
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("e"))
+            .map(|(_, value)| value)
+            .expect("the failures field is always there");
+
+        match errors {
+            rmpv::Value::Map(pairs) => assert!(pairs.is_empty(), "a stored value forged a failure"),
+            other => panic!("expected a map, got {other:?}"),
         }
     }
 
@@ -263,5 +393,14 @@ mod tests {
         let error = decode_arg(&rmpv::Value::from(7)).unwrap_err();
 
         assert!(error.contains("must be a string"), "{error}");
+    }
+
+    /// A server error to encode with: what the parser makes of an error reply,
+    /// which is exactly what a connection hands back.
+    fn server_error() -> Value {
+        match redis::parse_redis_value(b"-WRONGTYPE bad\r\n") {
+            Ok(value @ Value::ServerError(_)) => value,
+            other => panic!("expected a server error value, got {other:?}"),
+        }
     }
 }

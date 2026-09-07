@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace SConcur\Features\Redis\Support;
 
+use SConcur\Exceptions\Redis\InvalidRedisArgumentException;
+
 /**
  * Strings and counters.
  *
@@ -47,6 +49,13 @@ trait StringCommandsTrait
         bool $ifNotExists = false,
         bool $ifExists = false,
     ): bool {
+        if ($ttlSeconds !== null && $ttlMs !== null) {
+            throw new InvalidRedisArgumentException(
+                message: 'Pass either ttlSeconds or ttlMs, not both: SET takes one expiry, '
+                    . 'and both would build a command the server refuses.',
+            );
+        }
+
         $arguments = [$key, $value];
 
         if ($ttlSeconds !== null) {
@@ -96,6 +105,8 @@ trait StringCommandsTrait
     /**
      * MGET, keyed by the keys asked for rather than by position, so a caller does not have
      * to line the two lists up itself. A missing key is null.
+     *
+     * A key asked for twice appears once, because a map has one entry per key.
      *
      * @param list<string> $keys
      *

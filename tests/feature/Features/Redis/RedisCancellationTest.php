@@ -12,13 +12,18 @@ use SConcur\WaitGroup;
 use Throwable;
 
 /**
- * Stopping the flow under a running command, a cursor and a subscription. What is being
- * checked is not the exception but tearDown's dangling-task assertion: a task that ignored
- * its cancellation token is still there when the test ends.
+ * Stopping the flow under a running command, a cursor and a subscription.
+ *
+ * What proves it is the server's own client count, not the task count: a flow being
+ * stopped zeroes the latter by bookkeeping whether or not the task noticed its token, so a
+ * handler that ignored cancellation would leave these tests green. A socket the core
+ * failed to release is visible only on the other side.
  */
 class RedisCancellationTest extends BaseTestCase
 {
     private Connection $connection;
+
+    private int $baselineConnections = 0;
 
     protected function setUp(): void
     {
@@ -27,6 +32,12 @@ class RedisCancellationTest extends BaseTestCase
         TestRedisResolver::flush();
 
         $this->connection = TestRedisResolver::getConnection();
+
+        // Taken after the pool is warm, so the baseline counts the connections the
+        // feature keeps rather than the ones it is about to open.
+        $this->connection->ping();
+
+        $this->baselineConnections = TestRedisResolver::countServerConnections();
     }
 
     public function testStoppingAFlowUnderABlockingCommand(): void
@@ -57,9 +68,7 @@ class RedisCancellationTest extends BaseTestCase
             //
         }
 
-        // The connection still serves commands: the stop released what the blocking
-        // command held rather than leaving the pool short of it.
-        self::assertTrue($this->connection->ping());
+        $this->assertConnectionsSettleBack();
     }
 
     public function testStoppingAFlowUnderASubscription(): void
@@ -93,7 +102,41 @@ class RedisCancellationTest extends BaseTestCase
             //
         }
 
-        self::assertTrue($this->connection->ping());
+        $this->assertConnectionsSettleBack();
+    }
+
+    public function testStoppingAFlowUnderACursor(): void
+    {
+        $pipeline = $this->connection->pipeline();
+
+        for ($index = 0; $index < 500; ++$index) {
+            $pipeline->command('SET', ["cancel:scan:$index", '1']);
+        }
+
+        $pipeline->execute();
+
+        $waitGroup = WaitGroup::create();
+
+        $waitGroup->add(
+            callback: function () use ($waitGroup): void {
+                try {
+                    foreach ($this->connection->scan(match: 'cancel:scan:*', count: 5, batchSize: 1) as $ignored) {
+                        // Stopped in the middle of the walk, with the cursor open.
+                        $waitGroup->stop();
+                    }
+                } catch (Throwable) {
+                    //
+                }
+            },
+        );
+
+        try {
+            $waitGroup->waitAll();
+        } catch (Throwable) {
+            //
+        }
+
+        $this->assertConnectionsSettleBack();
     }
 
     public function testADeadlineThatRunsOutSurfacesAsATimeout(): void
@@ -107,5 +150,32 @@ class RedisCancellationTest extends BaseTestCase
         $this->expectException(RedisTimeoutException::class);
 
         $connection->command('BLPOP', ['never', 5], blocking: false);
+    }
+
+    /**
+     * The server's client count comes back to where it started. Retried for a
+     * moment, because the core releases a stopped task's connection as soon as it
+     * unwinds and PHP gets there first.
+     */
+    private function assertConnectionsSettleBack(): void
+    {
+        $baseline = $this->baselineConnections;
+
+        for ($attempt = 0; $attempt < 40; ++$attempt) {
+            $connections = TestRedisResolver::countServerConnections();
+
+            if ($connections <= $baseline + 4) {
+                self::assertLessThanOrEqual($baseline + 4, $connections);
+
+                return;
+            }
+
+            usleep(50_000);
+        }
+
+        self::fail(
+            'the stopped flow left connections behind: '
+            . TestRedisResolver::countServerConnections() . " against a baseline of $baseline",
+        );
     }
 }

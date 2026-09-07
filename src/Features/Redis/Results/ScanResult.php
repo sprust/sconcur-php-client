@@ -49,6 +49,12 @@ class ScanResult implements Iterator
     protected bool $isFinished = false;
 
     /**
+     * Whether rewind() has opened the cursor. Iterating without it is undefined
+     * in PHP's contract, but "undefined" must not mean "spins for ever".
+     */
+    protected bool $started = false;
+
+    /**
      * @param list<string> $arguments the command's arguments, without the cursor
      * @param bool         $pairs     whether the command answers with field and value
      *                                alternating (HSCAN, ZSCAN)
@@ -74,13 +80,15 @@ class ScanResult implements Iterator
 
     public function valid(): bool
     {
-        return !$this->isFinished;
+        return $this->started && !$this->isFinished;
     }
 
     public function rewind(): void
     {
         $this->releaseTask();
         $this->reset();
+
+        $this->started = true;
 
         $result = $this->connection->execute(
             command: RedisCommandEnum::Scan,
@@ -104,7 +112,7 @@ class ScanResult implements Iterator
 
     protected function advance(): void
     {
-        if ($this->isFinished) {
+        if ($this->isFinished || !$this->started) {
             return;
         }
 
@@ -120,6 +128,14 @@ class ScanResult implements Iterator
             }
 
             $this->pullBatch();
+
+            // pullBatch() gives up when there is nothing left to pull. Without
+            // this the loop would call it again on the same state for ever —
+            // a spin with no I/O in it, which no deadline and no coroutine
+            // switch can interrupt.
+            if ($this->isFinished) {
+                return;
+            }
         }
 
         if ($this->pairs) {
@@ -175,6 +191,7 @@ class ScanResult implements Iterator
     protected function reset(): void
     {
         $this->taskKey      = null;
+        $this->started      = false;
         $this->items        = [];
         $this->itemIndex    = 0;
         $this->position     = 0;

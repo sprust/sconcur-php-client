@@ -45,6 +45,36 @@ const MAX_POOL_SIZE: usize = 64;
 /// default is one second, which is a local-network number.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many connections one dsn may hold for blocking commands at once. A
+/// blocking command parks a whole socket for as long as it waits, so without a
+/// ceiling a hundred coroutines waiting on a queue are a hundred sockets, and
+/// the server's `maxclients` is what finds out.
+const MAX_DEDICATED_PER_DSN: usize = 64;
+
+/// How many of those are kept for the next command instead of being closed.
+/// Reuse is what keeps a consumer loop from paying a TCP handshake, an AUTH and
+/// a SELECT on every iteration.
+const MAX_IDLE_DEDICATED_PER_DSN: usize = 8;
+
+/// How long an idle dedicated connection may be lent again. A socket nobody has
+/// used for longer than this is dropped rather than handed to a command that
+/// would then fail on it — a blocking command failing because it was given a
+/// dead socket is a failure the caller cannot do anything about.
+const DEDICATED_IDLE_TTL: Duration = Duration::from_secs(30);
+
+/// How many times the manager re-dials before giving the failure to the caller.
+///
+/// The driver's own default is six, with a backoff that reaches six seconds — and
+/// a connection that cannot be made is usually one that will not be: a wrong
+/// password, a closed port, a wrong host. Six retries turn that into a deadline
+/// firing on a command, which tells the caller nothing about what is wrong.
+/// Two keeps a genuinely transient drop covered while a real failure still
+/// arrives as itself, inside any sensible deadline.
+const CONNECT_RETRIES: usize = 2;
+
+/// The ceiling on the backoff between those retries, for the same reason.
+const CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_millis(200);
+
 /// The driver's per-command timeout, turned off.
 ///
 /// redis-rs defaults it to 500 ms, and on this feature that is simply wrong: a
@@ -72,14 +102,39 @@ struct Entry {
     last_used_at: Instant,
 }
 
+/// The connections held for blocking commands on one dsn: the ones parked for
+/// reuse, and how many exist at all.
+struct DedicatedPool {
+    idle: Vec<(MultiplexedConnection, Instant)>,
+    live: usize,
+}
+
+impl DedicatedPool {
+    /// Drops the parked connections nobody has wanted for the idle ttl, and
+    /// counts them out of `live` — they existed, and now they do not. Forgetting
+    /// that second half is a slot leaked per expiry, which a consumer running
+    /// once a minute reaches the ceiling with in about an hour.
+    fn drop_stale(&mut self) {
+        let now = Instant::now();
+        let before = self.idle.len();
+
+        self.idle
+            .retain(|(_, returned_at)| now.duration_since(*returned_at) <= DEDICATED_IDLE_TTL);
+
+        self.live = self.live.saturating_sub(before - self.idle.len());
+    }
+}
+
 pub struct Pools {
     entries: Mutex<HashMap<PoolKey, Entry>>,
+    dedicated: Mutex<HashMap<String, DedicatedPool>>,
 }
 
 impl Pools {
     pub fn new() -> Self {
         Pools {
             entries: Mutex::new(HashMap::new()),
+            dedicated: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -107,6 +162,67 @@ impl Drop for Acquired {
     }
 }
 
+/// How long dialling may take, for the paths that have to apply it themselves —
+/// the pub/sub connection, which the driver opens without taking any
+/// configuration.
+pub fn connect_timeout() -> Duration {
+    CONNECT_TIMEOUT
+}
+
+/// A connection lent to one blocking command, and the slot it occupies in the
+/// dsn's ceiling.
+///
+/// It is created *before* the dial, holding no connection yet, because the slot
+/// has to be given back however the call ends — and one of the ways it ends is
+/// the deadline firing mid-dial, which drops this future without running another
+/// line of it. That was the shape of the bug this comment replaces: the count
+/// was taken under the lock and given back only on a dial that returned, so a
+/// cancelled dial leaked a slot and sixty-four of them killed the dsn.
+///
+/// `reusable` starts false for the same reason. A connection is lent on only
+/// after a command the server answered — well or badly — has left it clean; one
+/// cut off by a deadline or a stop is still owed a reply, and lending it on
+/// would hand somebody else that reply. Nothing sets the flag on the paths that
+/// end by being dropped, which is what makes "false unless proven clean" the
+/// only safe default.
+///
+/// The same rule the AMQP feature applies to a channel handed back dirty.
+pub struct Dedicated {
+    dsn: String,
+    connection: Option<MultiplexedConnection>,
+    reusable: bool,
+}
+
+impl Dedicated {
+    pub fn connection(&mut self) -> &mut MultiplexedConnection {
+        self.connection
+            .as_mut()
+            .expect("a lent connection is held until it is dropped")
+    }
+
+    /// Keeps the connection for the next command when this one finished on the
+    /// wire. A failure that is not the server's answer — a dropped socket, a
+    /// deadline, a stop — leaves it dirty, and it is dropped instead.
+    pub fn keep_if_clean<T>(
+        &mut self,
+        outcome: &std::result::Result<T, (super::errors::Kind, String)>,
+    ) {
+        self.reusable = match outcome {
+            Ok(_) => true,
+            Err((super::errors::Kind::Command, _)) => true,
+            Err(_) => false,
+        };
+    }
+}
+
+impl Drop for Dedicated {
+    fn drop(&mut self) {
+        let connection = self.connection.take();
+
+        get().release_dedicated(&self.dsn, connection.filter(|_| self.reusable));
+    }
+}
+
 /// The pools live on the Core, like every other process-wide registry here, so
 /// a fork discards them: a child that inherited the parent's entries would be
 /// writing into sockets that belong to another process.
@@ -127,6 +243,7 @@ pub fn start_sweeper() {
                 ticker.tick().await;
 
                 get().sweep();
+                get().sweep_dedicated();
             }
         });
     });
@@ -179,21 +296,84 @@ impl Pools {
         })
     }
 
-    /// Opens a connection nothing else will use: one blocking command, one
-    /// subscription. It is dialled here and dropped by its caller, never
-    /// entering the pool — a socket parked inside BLPOP is not a socket
-    /// anything else can borrow.
-    pub async fn dedicated(&'static self, dsn: &str) -> Result<MultiplexedConnection, String> {
+    /// Lends a connection nothing else will use for the length of one blocking
+    /// command. Taken from the parked ones when there is a fresh one, opened
+    /// otherwise, and refused once this dsn is holding as many as it may.
+    pub async fn dedicated(&'static self, dsn: &str) -> std::result::Result<Dedicated, String> {
+        let parked = {
+            let mut pools = self.dedicated.lock().unwrap();
+
+            let pool = pools.entry(dsn.to_string()).or_insert_with(|| DedicatedPool {
+                idle: Vec::new(),
+                live: 0,
+            });
+
+            pool.drop_stale();
+
+            match pool.idle.pop() {
+                Some((connection, _)) => Some(connection),
+                None => {
+                    if pool.live >= MAX_DEDICATED_PER_DSN {
+                        return Err(format!(
+                            "this connection is already holding {MAX_DEDICATED_PER_DSN} connections for blocking commands"
+                        ));
+                    }
+
+                    pool.live += 1;
+
+                    None
+                }
+            }
+        };
+
+        // From here the slot belongs to this handle: every way out of this
+        // function, the `?` operators and being dropped mid-dial included, runs
+        // its Drop and gives the slot back.
+        let mut dedicated = Dedicated {
+            dsn: dsn.to_string(),
+            connection: parked,
+            reusable: false,
+        };
+
+        if dedicated.connection.is_some() {
+            return Ok(dedicated);
+        }
+
         let client = self.client(dsn)?;
 
         let config = AsyncConnectionConfig::new()
             .set_response_timeout(RESPONSE_TIMEOUT)
             .set_connection_timeout(Some(CONNECT_TIMEOUT));
 
-        client
+        let connection = client
             .get_multiplexed_async_connection_with_config(&config)
             .await
-            .map_err(|error| format!("connect: {error}"))
+            .map_err(|error| format!("connect: {error}"))?;
+
+        dedicated.connection = Some(connection);
+
+        Ok(dedicated)
+    }
+
+    /// Takes a lent connection back: parked for the next command when it is
+    /// still clean and there is room, forgotten otherwise.
+    fn release_dedicated(&self, dsn: &str, connection: Option<MultiplexedConnection>) {
+        let mut pools = self.dedicated.lock().unwrap();
+
+        let Some(pool) = pools.get_mut(dsn) else {
+            return;
+        };
+
+        match connection {
+            Some(connection) if pool.idle.len() < MAX_IDLE_DEDICATED_PER_DSN => {
+                pool.idle.push((connection, Instant::now()));
+            }
+            _ => {
+                if pool.live > 0 {
+                    pool.live -= 1;
+                }
+            }
+        }
     }
 
     /// The client for a DSN, which is what opens a dedicated connection or a
@@ -227,6 +407,20 @@ impl Pools {
             .retain(|_, entry| entry.in_use > 0 || now.duration_since(entry.last_used_at) <= POOL_IDLE_TTL);
     }
 
+    /// Drops the parked connections of every dsn that have aged out. Without it
+    /// the last eight of a dsn stay open for the life of the process once the
+    /// traffic stops, which is not what "closed five minutes after its last
+    /// command" says.
+    fn sweep_dedicated(&self) {
+        let mut pools = self.dedicated.lock().unwrap();
+
+        for pool in pools.values_mut() {
+            pool.drop_stale();
+        }
+
+        pools.retain(|_, pool| pool.live > 0 || !pool.idle.is_empty());
+    }
+
     /// Called on extension shutdown.
     pub fn close_all(&self) {
         let drained: Vec<Entry> = self
@@ -237,7 +431,16 @@ impl Pools {
             .map(|(_, entry)| entry)
             .collect();
 
+        let parked: Vec<DedicatedPool> = self
+            .dedicated
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, pool)| pool)
+            .collect();
+
         drop(drained);
+        drop(parked);
     }
 }
 
@@ -272,7 +475,9 @@ fn build(key: &PoolKey) -> Result<Entry, String> {
         // ending the pool.
         let config = ConnectionManagerConfig::new()
             .set_response_timeout(RESPONSE_TIMEOUT)
-            .set_connection_timeout(Some(CONNECT_TIMEOUT));
+            .set_connection_timeout(Some(CONNECT_TIMEOUT))
+            .set_number_of_retries(CONNECT_RETRIES)
+            .set_max_delay(CONNECT_RETRY_MAX_DELAY);
 
         let connection = client
             .get_connection_manager_lazy(config)
@@ -294,6 +499,17 @@ fn build(key: &PoolKey) -> Result<Entry, String> {
 mod tests {
     use super::*;
 
+    /// How many connections a dsn holds for blocking commands.
+    fn live(pools: &Pools, dsn: &str) -> usize {
+        pools
+            .dedicated
+            .lock()
+            .unwrap()
+            .get(dsn)
+            .map(|pool| pool.live)
+            .unwrap_or(0)
+    }
+
     #[test]
     fn a_missing_pool_size_falls_back_to_the_default() {
         assert_eq!(normalize_pool_size(0), DEFAULT_POOL_SIZE);
@@ -304,6 +520,57 @@ mod tests {
     fn a_pool_size_is_capped() {
         assert_eq!(normalize_pool_size(2), 2);
         assert_eq!(normalize_pool_size(10_000), MAX_POOL_SIZE);
+    }
+
+    #[test]
+    fn giving_a_dedicated_connection_back_frees_its_slot() {
+        let pools = Pools::new();
+
+        pools.dedicated.lock().unwrap().insert(
+            "dsn".to_string(),
+            DedicatedPool {
+                idle: Vec::new(),
+                live: 2,
+            },
+        );
+
+        assert_eq!(live(&pools, "dsn"), 2);
+
+        // A connection given up rather than parked — what a deadline or a stop
+        // leaves behind — frees the slot instead of holding it for ever.
+        pools.release_dedicated("dsn", None);
+
+        assert_eq!(live(&pools, "dsn"), 1);
+
+        pools.release_dedicated("dsn", None);
+
+        assert_eq!(live(&pools, "dsn"), 0);
+    }
+
+    #[test]
+    fn releasing_an_unknown_dsn_does_nothing() {
+        let pools = Pools::new();
+
+        pools.release_dedicated("never-seen", None);
+
+        assert_eq!(live(&pools, "never-seen"), 0);
+    }
+
+    #[test]
+    fn the_slot_count_never_goes_below_zero() {
+        let pools = Pools::new();
+
+        pools.dedicated.lock().unwrap().insert(
+            "dsn".to_string(),
+            DedicatedPool {
+                idle: Vec::new(),
+                live: 0,
+            },
+        );
+
+        pools.release_dedicated("dsn", None);
+
+        assert_eq!(live(&pools, "dsn"), 0);
     }
 
     #[test]

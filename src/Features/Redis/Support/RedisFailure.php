@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace SConcur\Features\Redis\Support;
 
+use SConcur\Exceptions\Redis\InvalidRedisArgumentException;
 use SConcur\Exceptions\Redis\InvalidRedisDsnException;
 use SConcur\Exceptions\Redis\RedisCommandException;
 use SConcur\Exceptions\Redis\RedisConnectionException;
 use SConcur\Exceptions\Redis\RedisException;
 use SConcur\Exceptions\Redis\RedisTimeoutException;
+use SConcur\Exceptions\Redis\SubscriptionClosedException;
 use SConcur\Exceptions\Redis\UnsupportedRedisCommandException;
 use SConcur\Exceptions\TaskErrorException;
 use SConcur\Exceptions\TaskExecutionException;
@@ -17,111 +19,88 @@ use Throwable;
 /**
  * Turns a failed task into the exception the caller expects.
  *
- * The core prefixes its errors with the feature name and puts the Redis error code first
- * in the text, so the split here is one prefix and one first word — not a set of patterns
- * matched against whole messages, which would rot the moment the core reworded one.
+ * The kind is read, not guessed: the core writes it as `redis[<kind>]: <text>`
+ * (ext/src/features/redis/errors.rs) and everything after that prefix is opaque.
+ *
+ * This used to classify by matching the message, which was wrong in a way worth
+ * remembering: half of that message belongs to the server, and a Lua script
+ * answering `redis.error_reply("connect: ...")` could pick which exception the
+ * application caught — including the two that are LogicExceptions and so slip
+ * past a catch written for RedisException.
  */
 readonly class RedisFailure
 {
-    protected const string PREFIX = 'redis: ';
-
-    /** What the core says when a flow is stopped under a running command. */
-    protected const string STOPPED = 'closed by task stop';
+    /**
+     * The kinds the core writes, and what each is raised as. A kind missing from
+     * here is a core newer than this package, and becomes a plain RedisException
+     * rather than a guess.
+     *
+     * @var array<string, class-string<Throwable>>
+     */
+    protected const array KINDS = [
+        'cmd'     => RedisCommandException::class,
+        'conn'    => RedisConnectionException::class,
+        'timeout' => RedisTimeoutException::class,
+        'refused' => UnsupportedRedisCommandException::class,
+        'arg'     => InvalidRedisArgumentException::class,
+        'dsn'     => InvalidRedisDsnException::class,
+        'stopped' => RedisConnectionException::class,
+        'state'   => SubscriptionClosedException::class,
+    ];
 
     public static function from(
         TaskErrorException|TaskExecutionException|Throwable $exception,
-    ): RedisException|UnsupportedRedisCommandException|InvalidRedisDsnException {
-        $message = static::strip($exception->getMessage());
+    ): Throwable {
+        [$kind, $message] = static::split($exception->getMessage());
 
-        if (str_contains($message, 'would change the state of a shared connection')) {
-            // A LogicException, so it does not descend from RedisException and cannot be
-            // swallowed by a catch meant for a server failure.
-            return new UnsupportedRedisCommandException(
+        $class = static::KINDS[$kind] ?? null;
+
+        if ($class === null) {
+            return new RedisException(
                 message: $message,
                 previous: $exception,
             );
         }
 
-        if (static::isDsnFailure($message)) {
-            return new InvalidRedisDsnException(
-                message: $message,
-                previous: $exception,
-            );
-        }
-
-        [$code] = static::split($message);
-
-        if ($code === 'TIMEOUT') {
-            return new RedisTimeoutException(
-                message: $message,
-                previous: $exception,
-            );
-        }
-
-        if (static::isConnectionFailure($code, $message)) {
-            return new RedisConnectionException(
-                message: $message,
-                previous: $exception,
-            );
-        }
-
-        if ($code !== '') {
-            // The code stays in the message as well as in errorCode: it is the most
-            // greppable part of the text, and a log line that lost it says much less.
+        if ($class === RedisCommandException::class) {
             return new RedisCommandException(
-                errorCode: $code,
+                errorCode: static::errorCode($message),
                 message: $message,
                 previous: $exception,
             );
         }
 
-        return new RedisException(
+        return new $class(
             message: $message,
             previous: $exception,
         );
     }
 
-    protected static function strip(string $message): string
-    {
-        if (str_starts_with($message, static::PREFIX)) {
-            return substr($message, strlen(static::PREFIX));
-        }
-
-        return $message;
-    }
-
     /**
-     * The leading Redis error code, and what follows it. A code is a bare word in
-     * capitals, which is what the protocol puts first in an error reply.
+     * The kind and the text. A message without the prefix did not come from this
+     * feature — a failure raised before the core saw the payload, say — and is
+     * passed through whole.
      *
      * @return array{0: string, 1: string}
      */
     protected static function split(string $message): array
     {
-        $parts = explode(' ', $message, 2);
-
-        if (preg_match('/^[A-Z]{3,}$/', $parts[0]) !== 1) {
+        if (preg_match('/^redis\[([a-z]+)]: (.*)$/s', $message, $matches) !== 1) {
             return ['', $message];
         }
 
-        return [$parts[0], $parts[1] ?? ''];
+        return [$matches[1], $matches[2]];
     }
 
-    protected static function isDsnFailure(string $message): bool
+    /**
+     * The Redis error code a command failure starts with: a bare word in
+     * capitals, which is what the protocol puts first in an error reply. A
+     * message without one keeps an empty code rather than borrowing a word.
+     */
+    protected static function errorCode(string $message): string
     {
-        return str_starts_with($message, 'unsupported dsn scheme')
-            || str_starts_with($message, 'unknown dsn parameter')
-            || str_starts_with($message, 'empty dsn')
-            || str_starts_with($message, 'open client:');
-    }
+        $first = explode(' ', $message, 2)[0];
 
-    protected static function isConnectionFailure(string $code, string $message): bool
-    {
-        if ($code === 'IOERR' || $code === 'NOAUTH' || $code === 'WRONGPASS') {
-            return true;
-        }
-
-        return str_starts_with($message, 'connect:')
-            || str_contains($message, static::STOPPED);
+        return preg_match('/^[A-Z]{3,}$/', $first) === 1 ? $first : '';
     }
 }
