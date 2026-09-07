@@ -21,6 +21,7 @@ pub enum Method {
     WsRespond,
     WsClient,
     Amqp,
+    Redis,
     /// A method the core does not know. Kept as a variant rather than a parse
     /// error so the unknown-method message still reaches the feature factory,
     /// which is where it is reported.
@@ -46,6 +47,7 @@ impl Method {
             b"wsr" => Method::WsRespond,
             b"wsc" => Method::WsClient,
             b"amq" => Method::Amqp,
+            b"rds" => Method::Redis,
             _ => Method::Unknown,
         }
     }
@@ -67,6 +69,7 @@ impl Method {
             Method::WsRespond => "wsr",
             Method::WsClient => "wsc",
             Method::Amqp => "amq",
+            Method::Redis => "rds",
             Method::Unknown => "",
         }
     }
